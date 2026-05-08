@@ -278,7 +278,7 @@ print(f"  [ok] frames within a clip are distinct (per-pair mean diff: {[f'{d:.1f
 # Verify Ego4DR3MDataset (from the actual notebook) loads the output
 # ============================================================
 import json as _json
-nb = _json.load(open('dinov2_r3m_benchmark.ipynb'))
+nb = _json.load(open('baseline_2_dinov3_lora.ipynb'))
 ego4d_cell_src = None
 for c in nb['cells']:
     if c['cell_type'] == 'code' and 'class Ego4DR3MDataset' in ''.join(c['source']):

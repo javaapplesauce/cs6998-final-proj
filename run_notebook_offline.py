@@ -98,7 +98,7 @@ def _patched_run(args, *a, **kw):
 _sp_real.run = _patched_run
 
 # ---- Read notebook, extract code cells ----
-nb = json.load(open('dinov2_r3m_benchmark.ipynb'))
+nb = json.load(open('baseline_2_dinov3_lora.ipynb'))
 cells = nb['cells']
 N = len(cells)
 print(f"loaded {N} cells")

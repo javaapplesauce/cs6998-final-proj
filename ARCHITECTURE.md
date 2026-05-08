@@ -1,10 +1,15 @@
 # Architecture & Design Document
 
-**Project:** Benchmarking a DINOv2 + LoRA + CLIP visual representation against R3M (Nair et al., CoRL 2022) on R3M's published behavior-cloning protocol.
+**Project:** Three-way benchmark of visual representations for robot manipulation, evaluated on R3M (Nair et al., CoRL 2022)'s published behavior-cloning protocol.
 
-**Deliverable:** `dinov2_r3m_benchmark.ipynb` — a single, runnable Jupyter notebook that pretrains the new representation on Ego4D, then evaluates it against R3M's reported numbers on Franka Kitchen, MetaWorld, and (budget permitting) Adroit.
+**Three baselines:**
+- **Baseline 1 — R3M (paper).** ResNet50 with TCN+VLA+L1/L2 contrastive loss on Ego4D 1M steps. Numbers hardcoded from Tables 1-3 of arXiv:2203.12601.
+- **Baseline 2 — DINOv3 + LoRA + CLIP.** `baseline_2_dinov3_lora.ipynb`. DINOv3 ViT-B/16 frozen + LoRA r=16 trainable, R3M's exact loss formulation, Ego4D 150k steps (6.7× cut from R3M).
+- **Baseline 3 — DINOv3 + SAM 3 (frozen).** `baseline_3_dinov3_sam3.ipynb`. DINOv3 ViT-B/16 fully frozen + SAM 3 concept masking, **no Ego4D pretraining**, BC MLP only.
 
-**Constraint:** ≤ 4 hours wall-clock on a single A100 80GB.
+**The hypothesis:** if Baseline 3 ≥ Baseline 2, then Ego4D pretraining is redundant given DINOv3's strong init plus SAM 3's text-grounded object localization. If Baseline 2 > Baseline 3, the contrastive Ego4D pretraining adds something the foundation models alone don't capture.
+
+**Constraint:** ≤ 4 hours wall-clock per pipeline on a single A100 80GB.
 
 ---
 
@@ -12,39 +17,44 @@
 
 R3M is the SOTA general-purpose visual representation for robotic manipulation (as of CoRL 2022). It pretrains a ResNet50 on Ego4D human videos with three loss terms: time-contrastive InfoNCE, video-language alignment via DistilBERT, and L1+L2 regularization on the embedding. It is then frozen and used as a perception module under a small BC policy.
 
-Our hypothesis: **a foundation visual encoder (DINOv2) with cheap parameter-efficient adaptation (LoRA) can match or exceed R3M's downstream performance using a fraction of the pretrain compute.** R3M trained from scratch on Ego4D for 1M steps; we have a backbone already trained on ~142M images self-supervised. Most of R3M's pretrain budget goes into learning generic visual features that DINOv2 has already learned. We expect 5-10× pretrain speedup with comparable downstream success rate.
+We compare two challengers against R3M's published numbers on R3M's exact BC protocol:
 
-The comparison is **strict apples-to-apples on the downstream side**: identical BC architecture (2-layer MLP + BatchNorm), identical optimizer (Adam, lr 1e-3, batch 32, 20k steps, eval every 1k), identical environments and demo sizes, 3 seeds. The differences live entirely in the visual encoder.
+**Baseline 2 hypothesis:** *a foundation visual encoder (DINOv3) with cheap parameter-efficient adaptation (LoRA) can match or exceed R3M's downstream performance using a fraction of the pretrain compute.* R3M trained from scratch on Ego4D for 1M steps; DINOv3 is already trained on ~1.7B images self-supervised. Most of R3M's pretrain budget goes into learning generic visual features that DINOv3 has already learned. We expect 5-10× pretrain speedup with comparable downstream success rate.
+
+**Baseline 3 hypothesis:** *frozen foundation models with object-centric grounding need no Ego4D pretraining at all.* DINOv3's dense features carry spatial structure; SAM 3's text-prompted concept masks zero out distractor regions before global pooling. The two foundation models stay frozen; only a 3-layer MLP policy head trains on the demos. This isolates whether contrastive Ego4D pretraining (Baseline 2) is necessary or just a path-dependent legacy of R3M's 2022 design.
+
+The comparison is **strict apples-to-apples on the downstream side**: identical demo data, identical optimizer (Adam, lr 1e-3, batch 32, 20k steps, eval every 1k), identical environments and demo sizes, 3 seeds. Differences live in the visual encoder and (for B3) the policy MLP shape.
 
 ---
 
 ## 2. Why this architecture (and not the alternatives)
 
-### 2.1 Why DINOv2 ViT-B/14 over R3M's ResNet50?
+### 2.1 Why DINOv3 ViT-B/16 over R3M's ResNet50 or DINOv2?
 
-| Property | R3M ResNet50 | DINOv2 ViT-B/14 (ours) |
+| Property | R3M ResNet50 | DINOv3 ViT-B/16 (ours) |
 |---|---|---|
 | Params | 23 M | 86 M |
-| Pretrain data | Ego4D only (~5M clips) | LVD-142M (curated 142M images) |
-| Pretrain objective | Time-contrastive + VLA + L1/L2 | DINO + iBOT + KoLeo (self-supervised) |
+| Pretrain data | Ego4D only (~5M clips) | LVD-1689M (~1.7B curated images) |
+| Pretrain objective | Time-contrastive + VLA + L1/L2 | DINO + iBOT + Gram Anchoring (DINOv3) |
 | Effective receptive field | local conv stack | global attention |
-| Released features | 2048-dim global pool | 768-dim CLS + 256 patch tokens |
+| Released features | 2048-dim global pool | 768-dim CLS + 196 patch tokens |
 
-**Pros of DINOv2:**
-- Trained on **30× more data** than Ego4D, with extensive curation. Reproducibly outperforms ImageNet-supervised ResNet50 on dense prediction tasks (DINOv2 paper, Table 6).
-- Patch-token outputs are spatially structured and useful for object-aware policies (we don't exploit this here, but it's a future-work lever).
-- Modern attention block. Plays well with LoRA — every block has the same `qkv/proj/fc1/fc2` structure, making adapter injection uniform.
+**Pros of DINOv3 (over DINOv2):**
+- Trained on **12× more data** than DINOv2 (1.7B vs 142M images). Released August 2025.
+- Gram Anchoring objective specifically prevents dense-feature collapse — patch tokens stay sharp and semantically distinct, which directly benefits Baseline 3's masking and is generally good for fine-grained manipulation perception even in Baseline 2's CLS-only path.
+- Modern attention block, same `qkv/proj/fc1/fc2` structure as DINOv2 → LoRA injection logic is identical.
 
-**Cons of DINOv2:**
-- 3.7× more params → higher GPU memory and compute per forward.
-- Trained at 518×518 resolution; we use 224×224 (1/4 the patches), forcing pos-embed interpolation. Literature reports 1-3% drop on dense tasks at 224.
-- The pretrain distribution (curated web images) has a **larger domain gap** to egocentric Ego4D than R3M's in-domain training. Whether this matters for manipulation transfer is exactly what we're testing.
+**Cons of DINOv3:**
+- **Gated weights** (request access at https://ai.meta.com/dino-v3 → URL-emailed weights, or `hf auth login` for HuggingFace mirror).
+- /16 patch (vs /14 in DINOv2) — 196 patches at 224 instead of 256, ~24% fewer tokens. Less spatial detail but faster forward.
+- Pretrain distribution (curated web images) has a larger domain gap to egocentric Ego4D than R3M's in-domain training. Whether this matters for manipulation transfer is exactly what we're testing.
 
 **Alternatives considered and rejected:**
-- **ViT-S/14 DINOv2** — 4× smaller (22M), would fit easily in budget but loses the headline. Reserved as a fallback if compute pressures hit.
-- **ResNet50 with DINO weights** (DINO v1) — older and weaker than DINOv2 on most evals.
-- **MAE ViT-B/16** — strong but pretrains via reconstruction, which captures pixel statistics rather than semantic abstraction. R3M's head-to-head against MVP (ViT-B MAE on Ego-Soup) showed MAE losing by ~10% on Franka — exactly the gap DINOv2 should close, since DINOv2 explicitly optimizes for invariant semantic features.
-- **CLIP ViT-B/16 visual** — already strong on object semantics but loses spatial grounding. R3M paper showed CLIP underperforming R3M on Franka (~42% vs 53%). We use CLIP for text only, where it dominates.
+- **DINOv3 ViT-L/16** (300 M) — better features but 3-4× compute. Reserved as a CONFIG flag for users with more budget. Default to ViT-B/16 for like-for-like comparison with R3M's 23M-param ResNet50 (already 4× larger).
+- **DINOv3 ViT-S/16** — 21M, would fit easily in budget but loses the headline.
+- **DINOv2 ViT-B/14** — original baseline; superseded by DINOv3 (12× more pretrain data + Gram Anchoring) and so used only as a fallback.
+- **MAE ViT-B/16** — strong but pretrains via reconstruction. R3M's head-to-head against MVP (MAE on Ego-Soup) showed MAE losing by ~10% on Franka.
+- **CLIP ViT-B visual** — already strong on object semantics but loses spatial grounding. R3M showed CLIP underperforming R3M (~42% vs 53% on Franka). We use CLIP for text only.
 
 ### 2.2 Why LoRA r=16 instead of full fine-tuning or no adaptation?
 
@@ -104,6 +114,27 @@ R3M used DistilBERT (768-dim) for the language side of the VLA loss. We use CLIP
 - **CLIP ViT-L/14 text** — better but heavier. ViT-B/32 is the right cost point given this is text-only and cached.
 
 ---
+
+### 2.4 Baseline 3-specific decisions
+
+**Why fully frozen, no LoRA?**
+The hypothesis Baseline 3 tests is "frozen foundation models suffice." LoRA would conflate "did adaptation help?" with "did the frozen foundation help?" — exactly Baseline 2's question. Baseline 3 must keep both DINOv3 and SAM 3 frozen for the comparison to be meaningful.
+
+**Why dense feature map (h × w × D) instead of CLS token (D)?**
+SAM 3's mask is spatial. Multiplying a (14×14) mask against a CLS-pooled vector is meaningless. The whole point of Baseline 3's design is to mask **before** pooling — so we use `get_intermediate_layers(reshape=True)` to get `(B, D, h, w)`, apply the mask, then GAP. DINOv3's Gram Anchoring is what makes this practical: in DINOv2, dense features can collapse (all patches look similar after fine-tuning); in DINOv3 they stay distinct.
+
+**Why SAM 3 once per episode at eval time?**
+Real-time SAM at every rollout step would be 50ms × 200 horizons × 10 episodes × 20 evals × 100+ BC runs ≈ hours per BC run. The proposal's "concept-aware mask at every step" is computationally infeasible in our 4 h budget. Compromise: SAM runs once at episode start; mask is reused across the episode. Configurable refresh via `CONFIG['sam_refresh_steps']`. This is a mild approximation — for static target objects (most of the R3M task suite), the mask stays accurate for the episode duration.
+
+**Why 3-layer MLP + LayerNorm instead of B2's 2-layer + BatchNorm?**
+This is the proposal's exact spec (proposal §3.1). LayerNorm is appropriate for non-batch-correlated features; BatchNorm at input was R3M's choice because their CNN features were less normalized. Frozen DINOv3 features are already L2-bounded by the final LayerNorm in the backbone, so BatchNorm at input has less utility — LayerNorm in the MLP body is more standard for this regime.
+
+**Why empty-mask fallback?**
+If SAM 3 returns no instances for a given prompt, `mask.sum() == 0` and `feat ⊙ mask` is all zeros, killing all signal. Baseline 3's `masked_feature_pool` falls back to unmasked GAP when the mask is empty — keeping the policy operational even when the segmenter fails. Logged as a degraded-mode warning (no explicit log yet — TODO if patterns emerge).
+
+**Why same demo data as Baseline 2?**
+The proposal originally specifies "~50 teleoperated demonstrations" in Isaac Gym/Robosuite. We deviate: Baseline 3 uses R3M's pre-existing demo `.pkl` files in mj_envs / MetaWorld / Adroit. Reasoning: (a) avoids 30+ hours of teleoperation collection, (b) gives us a shared demo set across all three baselines for direct comparison, (c) tests the proposal's architecture on a more demanding benchmark than 50 demos × 2 tasks. The cost is moving away from the proposal's claimed eval task list (which is its prerogative, not a strict requirement).
+
 
 ## 3. High-level architecture
 
@@ -656,11 +687,14 @@ Things the design supports but we don't run:
 
 | File | Purpose |
 |---|---|
-| `dinov2_r3m_benchmark.ipynb` | The deliverable — 37-cell notebook |
-| `build_notebook.py` | Regenerates the notebook from a single Python source (easier to diff than raw .ipynb JSON) |
-| `smoke_test.py` | Standalone CPU smoke test for the core pipeline (exercises everything without DINOv2 or sim deps via a stub backbone) |
+| `baseline_2_dinov3_lora.ipynb` | Baseline 2 deliverable — 37-cell notebook (DINOv3 + LoRA + R3M-loss pretrain on Ego4D) |
+| `baseline_3_dinov3_sam3.ipynb` | Baseline 3 deliverable — 29-cell notebook (DINOv3 + SAM 3, fully frozen, no Ego4D pretrain) |
+| `build_notebook.py` | Regenerates baseline 2 from a single Python source (easier to diff than raw .ipynb JSON) |
+| `build_notebook_b3.py` | Regenerates baseline 3 |
+| `smoke_test.py` | Standalone CPU smoke test for baseline 2's core pipeline (DINOv3 stubbed) |
 | `smoke_test_preprocess.py` | Standalone smoke test for `preprocess_ego4d` against synthetic mp4 + narrations.json |
-| `run_notebook_offline.py` | Integration test that exec()s the notebook cells in order with DINOv2 + pyarrow + sim deps stubbed |
+| `run_notebook_offline.py` | Integration test that exec()s baseline 2's cells in order with DINOv3 + pyarrow + sim deps stubbed |
+| `run_notebook_offline_b3.py` | Integration test for baseline 3 (DINOv3 + SAM 3 + sim deps stubbed) |
 | `2203.12601v3.pdf` | The R3M paper (reference) |
 | `paper.txt` | Plain-text extract of the paper (used during development to look up exact numbers) |
 | `ARCHITECTURE.md` | This file |

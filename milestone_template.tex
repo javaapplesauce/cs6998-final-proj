@@ -1,0 +1,98 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{times}
+\usepackage[numbers]{natbib}
+\usepackage{multicol}
+\usepackage[bookmarks=true]{hyperref}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[inkscapelatex=false]{svg}
+\usepackage[section]{placeins}
+
+\pdfinfo{
+   /Author (Richard Li)
+   /Title  (Concept-Aware Visual Representations for Robotic Manipulation)
+   /Subject (Robotics)
+   /Keywords (R3M; DINOv3; SAM3; Robot Manipulation; Imitation Learning)
+}
+
+\begin{document}
+
+% paper title
+\title{Concept-Aware Visual Representations for Robotic Manipulation}
+
+\author{\authorblockN{Richard Li}
+\authorblockA{Columbia University  \\
+New York City, NY \\
+Email: rjl2194@columbia.edu}
+\and
+\authorblockN{Luke Yuan}
+\authorblockA{Columbia University \\
+New York City, NY \\
+Email: luke.yuan@columbia.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+General-purpose robot manipulation requires visual representations that are spatially precise and semantically grounded.
+While models like R3M pioneered the use of human video pre-training for robotic features, they often struggle with spatial feature degradation and semantic ambiguity in cluttered scenes.
+We propose a hybrid vision-action stack that integrates DINOv3's dense geometric features with SAM 3's promptable concept segmentation.
+By replacing legacy contrastive objectives with frozen, high-fidelity foundation models, we aim to bridge the human-robot domain gap and improve the generalization of imitation learning policies in manipulation tasks.
+\end{abstract}
+
+\IEEEpeerreviewmaketitle
+
+\section{Introduction}
+General-purpose robot manipulation requires visual representations that are both spatially precise and semantically grounded. While models like R3M pioneered the use of human video pre-training for robotic features, they often struggle with spatial feature degradation and semantic ambiguity in cluttered scenes. To address this, we propose a hybrid vision-action stack that integrates DINOv3's dense geometric features with SAM 3's promptable concept segmentation. By replacing legacy contrastive objectives with these frozen, high-fidelity foundation models, we aim to bridge the human-robot domain gap and improve the generalization of imitation learning policies in manipulation tasks. 
+
+\section{Problem Statement}
+The core problem is that standard visual backbones fail to preserve sharp object boundaries and lack the object-centric awareness needed to isolate targets in cluttered environments. We are developing a method to create an object-centric training process that is invariant to background noise and human-robot morphology differences. 
+
+\textbf{Dataset:} We will utilize a dataset of approximately 50 expert demonstrations collected via teleoperation.
+
+\textbf{Evaluation Criteria:} We will evaluate the policy in simulation (using NVIDIA Isaac Gym or Robosuite). 
+
+\textbf{Expected Results:} We expect to achieve a higher Success Rate (SR) across multiple tasks (e.g., ``Pick and Place,'' ``Drawer Opening'') compared to R3M and VC-1 baselines. We also expect to see accurate attention maps demonstrating that the policy focuses on the targeted semantic concepts during execution.
+
+\section{Literature Review}
+The field of pre-trained visual representations (PVRs) has moved rapidly toward larger architectures, with models like VC-1 \cite{majumdar2023vc1} demonstrating that scaling to ViT-L backbones significantly improves performance on robotic benchmarks. Existing universal representations, such as R3M, are typically trained on human video datasets using time-contrastive learning. However, these models still lack explicit object-level understanding. 
+
+Recent breakthroughs provide tools to solve these bottlenecks. DINOv3 \cite{simeoni2025dinov3} introduces techniques to prevent feature collapse, providing superior spatial correspondence. Furthermore, SAM 3 \cite{carion2025sam3segmentconcepts} has evolved the ``Segment Anything'' task into open-vocabulary ``Concept Segmentation,'' allowing for semantic grounding previously out of reach for prior models. Our work builds on these foundations by proposing a hybrid stack that leverages these frozen emergent properties for downstream imitation learning.
+
+\section{Technical Approach}
+We propose a policy $\pi_\theta$ that maps a multi-modal state $s_t$ to a 6-DOF action $a_t = (\Delta x, \Delta y, \Delta z, \Delta \phi, \Delta \psi, \Delta \xi) \in \mathbb{R}^6$, representing translational and rotational end-effector displacements. At each timestep, the input state $s_t$ consists of three components:
+
+\begin{itemize}
+    \item \textbf{Dense Spatial Features:} From an RGB observation $I_t$, we extract a dense feature map $F_t$ using a frozen DINOv3 ViT-L/14 encoder. DINOv3's Gram Anchoring ensures $F_t$ preserves high-rank spatial structures critical for grasp pose estimation.
+    \item \textbf{Concept-Aware Masks:} Given a natural language task description $\ell$, SAM 3 generates a binary concept mask $M_t$ to localize the task-relevant object. We apply this mask element-wise to produce filtered features $\hat{F}_t = F_t \odot M_t$, zeroing out background noise.
+    \item \textbf{Proprioception:} We track the robot's joint configuration and end-effector pose, represented as a 14-dimensional vector $z_t^{\text{prop}}$.
+\end{itemize}
+
+The masked feature map $\hat{F}_t$ is spatially pooled to produce a visual embedding $z_t^{\text{vis}}$, concatenated with the proprioceptive state, and passed through a 3-layer MLP:
+\begin{equation}
+    a_t = \pi_\theta(z_t^{\text{vis}} \oplus z_t^{\text{prop}})
+\end{equation}
+The policy is trained via behavioral cloning on expert demonstrations, minimizing the MSE loss:
+\begin{equation}
+    \mathcal{L}(\theta) = \frac{1}{N} \sum_{i=1}^{N} \|\pi_\theta(s_i) - a_i\|_2^2
+\end{equation}
+Because the foundation models ($f_{\text{DINO}}$ and $g_{\text{SAM}}$) remain frozen, we preserve their spatial and semantic fidelity while drastically reducing trainable parameters, enabling efficient learning from limited demonstrations.
+
+\section{Intermediate / Preliminary Results}
+To date, we have established our core codebase and project infrastructure. Our primary focus has been on environment setup and architecture implementation rather than end-to-end evaluation. 
+
+Currently, the simulation environments are configured, and the baseline implementations are prepared. We have successfully scripted the integration pipeline for the frozen DINOv3 and SAM 3 encoders to process multi-modal states and feed into our MLP policy head. 
+
+At this stage, we have not yet run full training tests or quantitative evaluations. Our immediate next step is executing the collection of the $\sim$50 teleoperated demonstrations required for our behavioral cloning dataset. Once the data collection is finalized, we will begin training the MLP head and generating the preliminary Success Rate (SR) benchmarks to compare our hybrid stack against the R3M baseline.
+
+\section{Model Implementation Diagram}
+\begin{figure}[h]
+    \centering
+    \includesvg[width=.9\columnwidth]{diagram}
+\end{figure}
+
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

@@ -2,7 +2,7 @@
 import json, uuid
 from pathlib import Path
 
-NB_PATH = Path(__file__).parent / "dinov2_r3m_benchmark.ipynb"
+NB_PATH = Path(__file__).parent / "baseline_2_dinov3_lora.ipynb"
 
 cells = []
 
@@ -30,12 +30,17 @@ def code(src: str):
 # ============================================================
 # Cell 1 — title & overview
 # ============================================================
-md("""# DINOv2 + LoRA + CLIP vs. R3M — Benchmark Notebook
+md("""# Baseline 2: DINOv3 + LoRA + CLIP vs. R3M — Benchmark Notebook
 
-Goal: train a DINOv2 (ViT-B/14, frozen) backbone with LoRA adapters using R3M's
+Goal: train a DINOv3 (ViT-B/16, frozen) backbone with LoRA adapters using R3M's
 loss formulation (time-contrastive + video-language alignment + L1/L2) on Ego4D,
 then evaluate on Franka Kitchen + MetaWorld (+ Adroit if budget permits) with the
 exact R3M behavior-cloning protocol.
+
+This is **Baseline 2** in our three-way comparison:
+- **Baseline 1**: R3M (Nair et al., 2022) — ResNet50 with TCN+VLA+L1/L2 on Ego4D 1M steps. Numbers hardcoded from paper Tables 1-3.
+- **Baseline 2** (this notebook): DINOv3 ViT-B/16 + LoRA r=16, R3M's losses on Ego4D 150k steps.
+- **Baseline 3** (`baseline_3_dinov3_sam3.ipynb`): DINOv3 ViT-L/16 + SAM 3 concept masks, fully frozen, no Ego4D pretraining.
 
 Reference: Nair et al., *R3M: A Universal Visual Representation for Robot
 Manipulation*, CoRL 2022 (arXiv:2203.12601). λ values from Appendix A.2; BC
@@ -61,7 +66,7 @@ md("""## Bottleneck analysis & wall-clock budget
 
 **Top 3 bottlenecks & mitigations**
 1. Ego4D I/O — pre-extracted JPEG cache + cached CLIP text embeddings + persistent DataLoader workers.
-2. ViT-B/14 fwd/bwd — bf16, `torch.compile`, frozen backbone (LoRA-only optimizer state).
+2. ViT-B/16 fwd/bwd — bf16, `torch.compile`, frozen backbone (LoRA-only optimizer state).
 3. BC sweep is sim-rollout-bound — pre-extract per-frame features once per (task, view); 3-checkpoint plateau early stopping; reduced eval episodes.
 
 **Cut order if running long (`CONFIG['cut_level']`)**
@@ -115,16 +120,17 @@ CONFIG = {
     'pretrain_ckpt':    './cache/pretrain.pt',
 
     # ---- model ----
-    'dinov2_variant':   'dinov2_vitb14',            # ViT-B/14, 86M params, 768-dim feature
+    'dinov3_variant':   'dinov3_vitb16',            # ViT-B/16, 86M params, 768-dim feature
+    'dinov3_weights':   None,                       # local path or URL (gated via https://ai.meta.com/dino-v3); leave None to fail loudly if unset at production load
     'clip_variant':     'ViT-B-32-quickgelu',       # MUST be -quickgelu for pretrained='openai' (otherwise activation mismatch ≈ 0.35 max diff in text embeds — degrades VLA)
     'clip_pretrained':  'openai',
-    'feat_dim':         768,                        # DINOv2 ViT-B/14 output dim
+    'feat_dim':         768,                        # DINOv3 ViT-B/16 output dim (CLS token); 1024 for vitl16
     'text_dim':         512,                        # CLIP ViT-B/32 text dim
     'lora_rank':        16,
     'lora_alpha':       16,
     'lora_dropout':     0.05,
-    'lora_targets':     ('qkv', 'proj', 'fc1', 'fc2'),  # attention + MLP modules in DINOv2 blocks
-    'lang_head_hidden': (1024, 1024, 1024, 1024),   # 5-layer MLP per Appendix A.2
+    'lora_targets':     ('qkv', 'proj', 'fc1', 'fc2'),  # attention + Mlp modules; verified for dinov3 vitb16 / vitl16 (ffn_layer='mlp', so fc1/fc2 — NOT applicable for vitl16plus / hyplus / 7b which use SwiGLU and need ('w1','w2','w3'))
+    'lang_head_hidden': (1024, 1024, 1024, 1024),   # 5-layer MLP per R3M Appendix A.2
 
     # ---- pretrain ----
     'pretrain_steps':       150_000,                # cut from R3M's 1M; justified by DINOv2 init
@@ -862,13 +868,27 @@ def count_trainable(m: nn.Module):
 # ============================================================
 # Cell 9 — Model
 # ============================================================
-code("""# ===== CELL 9: model — DINOv2 backbone + LoRA + language head + projection =====
-# DINOv2 ViT-B/14 from torch.hub. Backbone frozen; LoRA injected into qkv/proj/fc1/fc2.
-# Language head Gθ is a 5-layer MLP (per Appendix A.2) over [z0, zj, l_emb] -> scalar score.
+code("""# ===== CELL 9: model — DINOv3 backbone + LoRA + language head + projection =====
+# DINOv3 ViT-B/16 from torch.hub. Backbone frozen; LoRA injected into qkv/proj/fc1/fc2.
+# Language head Gθ is a 5-layer MLP (per R3M Appendix A.2) over [z0, zj, l_emb] -> scalar score.
 # We use CLIP text dim (512) instead of DistilBERT (768); the architecture is otherwise identical.
+#
+# NOTE on weights: DINOv3 weights are gated. After requesting access at
+# https://ai.meta.com/dino-v3, set CONFIG['dinov3_weights'] to the URL or local path
+# from the email. Without weights, the model architecture loads but is randomly
+# initialized — useless for production but fine for the smoke section (which
+# stubs the backbone entirely).
 
-def load_dinov2_backbone(variant: str):
-    return torch.hub.load('facebookresearch/dinov2', variant)
+def load_dinov3_backbone(variant: str, weights):
+    if weights is None:
+        raise RuntimeError(
+            "CONFIG['dinov3_weights'] is None. DINOv3 weights are gated — request "
+            "access at https://ai.meta.com/dino-v3 and set the URL/local-path here."
+        )
+    return torch.hub.load(
+        'facebookresearch/dinov3', variant,
+        source='github', weights=weights,
+    )
 
 class LanguageHead(nn.Module):
     def __init__(self, feat_dim, text_dim, hidden=(1024, 1024, 1024, 1024)):
@@ -889,7 +909,7 @@ class DinoLoRAR3M(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.backbone = load_dinov2_backbone(cfg['dinov2_variant'])
+        self.backbone = load_dinov3_backbone(cfg['dinov3_variant'], cfg.get('dinov3_weights'))
         for p in self.backbone.parameters():
             p.requires_grad = False
         n_lora = inject_lora(self.backbone, cfg['lora_targets'],
@@ -1492,7 +1512,7 @@ def make_summary_md(ours, delta_rows, baseline):
     lines.append("\\n## Reproduction notes\\n")
     lines.append("- Hardware: 1× A100 80GB; bf16 + torch.compile.")
     lines.append(f"- Pretrain: {CONFIG['pretrain_steps']:,} steps (vs. R3M's 1M); "
-                 f"DINOv2 ViT-B/14 frozen + LoRA r={CONFIG['lora_rank']}; CLIP ViT-B/32 text embeds for VLA.")
+                 f"DINOv3 ViT-B/16 frozen + LoRA r={CONFIG['lora_rank']}; CLIP ViT-B/32 text embeds for VLA.")
     lines.append(f"- BC: 2-layer MLP {CONFIG['bc_hidden']} + BatchNorm, lr {CONFIG['bc_lr']}, "
                  f"{CONFIG['bc_steps']:,} steps, eval every {CONFIG['bc_eval_every']:,}, "
                  f"{CONFIG['bc_eval_episodes']} eval episodes.")
@@ -1521,9 +1541,16 @@ training loop runs end-to-end, *not* that the real environments work. The real
 sim envs are exercised on the first BC run in the production sweep below.
 
 **What runs for real:** Ego4D dataset class, CLIP text embedding (real download
-on first run, ~600 MB), DINOv2 ViT-B/14 (real torch.hub download on first run,
-~330 MB), LoRA injection, all three losses, optimizer step, checkpoint save +
-load, feature pre-extraction, BC training, aggregation, plotting, markdown.
+on first run, ~600 MB), DINOv3 ViT-B/16 (loaded via torch.hub from a gated
+weights URL set in CONFIG['dinov3_weights']), LoRA injection, all three losses,
+optimizer step, checkpoint save + load, feature pre-extraction, BC training,
+aggregation, plotting, markdown.
+
+**DINOv3 weight access:** weights are gated. Request access at
+https://ai.meta.com/dino-v3 and set `CONFIG['dinov3_weights']` to the URL or
+local path before running production cells. The smoke section bypasses this by
+stubbing `load_dinov3_backbone` with a fake module that mirrors DINOv3's CLS
+output dimensionality.
 
 If everything works you'll see `=== ALL SMOKE TESTS PASSED ===` at the end.
 Any failure surfaces as a Python `AssertionError` with the failing assertion.
@@ -1627,15 +1654,50 @@ if RUN_SMOKE_TESTS:
     assert _smoke_clip_cache['embeds'].shape == (8, 512)
     log("smoke 3/9: CLIP text cache OK ({})".format(tuple(_smoke_clip_cache['embeds'].shape)))
 
-    # ---- 3. Model assembly (DINOv2 hub download triggers here on first run) ----
-    log("smoke: instantiating DinoLoRAR3M (DINOv2 ViT-B/14 hub-load on first run, ~330MB)...")
+    # ---- 3. Model assembly (DINOv3 — stubbed in smoke; production needs gated weights) ----
+    # Bypass the gated DINOv3 weight load for smoke by replacing load_dinov3_backbone with a stub.
+    # We use proper nn.Module subclasses (not nn.ModuleDict) so that setattr-based LoRA injection
+    # actually replaces the Linears in the module tree.
+    class _StubAttn(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.qkv  = nn.Linear(d, 3*d)
+            self.proj = nn.Linear(d, d)
+        def forward(self, x):
+            q, k, v = self.qkv(x).chunk(3, dim=-1)
+            return self.proj(q + k + v) / 3
+    class _StubMlp(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.fc1 = nn.Linear(d, 4*d)
+            self.fc2 = nn.Linear(4*d, d)
+        def forward(self, x): return self.fc2(nn.functional.gelu(self.fc1(x)))
+    class _StubBlock(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.attn = _StubAttn(d); self.mlp = _StubMlp(d)
+        def forward(self, x): return x + self.mlp(x + self.attn(x))
+    class _FakeDinov3(nn.Module):
+        def __init__(self, d):
+            super().__init__()
+            self.blocks = nn.ModuleList([_StubBlock(d) for _ in range(12)])
+            self.norm   = nn.LayerNorm(d)
+            self._bulk  = nn.Parameter(torch.zeros(80_000_000 // 1024, 1024))   # frozen-count sanity
+        def forward(self, x):
+            feat = nn.functional.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
+            feat = nn.functional.pad(feat, (0, SMOKE_CONFIG['feat_dim'] - feat.shape[-1]))
+            for blk in self.blocks: feat = blk(feat)
+            return self.norm(feat)
+    _real_load_dinov3 = load_dinov3_backbone
+    globals()['load_dinov3_backbone'] = lambda variant, weights: _FakeDinov3(SMOKE_CONFIG['feat_dim'])
+    log("smoke: instantiating DinoLoRAR3M (stubbed DINOv3 — production needs gated weights)...")
     _smoke_model = DinoLoRAR3M(SMOKE_CONFIG).to(DEVICE)
     _trainable = [p for p in _smoke_model.parameters() if p.requires_grad]
     n_train = sum(p.numel() for p in _trainable)
     assert n_train > 0, "no trainable params after LoRA injection"
     # Sanity: backbone param count should be huge but frozen
     n_frozen = sum(p.numel() for p in _smoke_model.backbone.parameters() if not p.requires_grad)
-    assert n_frozen > 80_000_000, f"expected ViT-B/14 ~86M frozen params, got {n_frozen:,}"
+    assert n_frozen > 80_000_000, f"expected ViT-B/16 ~86M frozen params, got {n_frozen:,}"
     log(f"smoke 4/9: model OK (trainable={n_train:,}, frozen={n_frozen:,})")
 
     # ---- 4. Forward + losses + gradient flow ----
@@ -1729,7 +1791,10 @@ code("""# ===== SMOKE 3: cleanup =====
 if RUN_SMOKE_TESTS:
     import shutil
     shutil.rmtree('./_smoke', ignore_errors=True)
-    log("smoke artifacts removed; production caches untouched")
+    # Restore the real DINOv3 loader so production cells use it
+    if '_real_load_dinov3' in globals():
+        globals()['load_dinov3_backbone'] = _real_load_dinov3
+    log("smoke artifacts removed; production caches untouched; DINOv3 loader restored")
 """)
 
 
@@ -1748,7 +1813,7 @@ disk are reused unless explicitly invalidated.
 | Cell | What it does | Skip condition |
 |---|---|---|
 | build CLIP cache | encodes all unique narrations once | `cache/clip_text_embeds.pt` exists |
-| pretrain | 150k step ViT-B/14 + LoRA training | `cache/pretrain.pt` exists |
+| pretrain | 150k step ViT-B/16 + LoRA training | `cache/pretrain.pt` exists |
 | feature extract | DINOv2-LoRA over all demo frames | per-(task, view) cache hit |
 | BC sweep | (env × task × view × demos × seed) loops | always runs |
 | aggregate + plot | `results/*.png`, summary stats | always runs |

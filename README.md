@@ -1,39 +1,50 @@
-# DINOv2 + LoRA + CLIP vs. R3M Benchmark
+# Three-Way Benchmark of Visual Representations for Robot Manipulation
 
-A reproducible benchmark pitting a parameter-efficient DINOv2 + LoRA + CLIP-text visual representation against R3M (Nair et al., CoRL 2022) on R3M's published behavior-cloning protocol over Franka Kitchen, MetaWorld, and Adroit.
+Reproducible head-to-head against R3M (Nair et al., CoRL 2022) on R3M's published behavior-cloning protocol over Franka Kitchen, MetaWorld, and Adroit.
 
-**Hardware target:** 1× NVIDIA A100 80GB. **Wall clock:** ≤ 4 hours.
+| Notebook | Architecture | Pretrain | Trainable params |
+|---|---|---|---|
+| (Baseline 1: R3M) | ResNet50 + R3M-loss | Ego4D 1M steps | full backbone (numbers from paper) |
+| `baseline_2_dinov3_lora.ipynb` | **DINOv3 ViT-B/16 + LoRA + CLIP-text** | Ego4D 150k steps (R3M-loss) | LoRA r=16 + lang head (~7.6M) |
+| `baseline_3_dinov3_sam3.ipynb` | **DINOv3 ViT-B/16 + SAM 3 (frozen)** | none | BC MLP only (~200K) |
+
+**Hypothesis:** if Baseline 3 ≥ Baseline 2, Ego4D pretraining is redundant given DINOv3's strong init plus SAM 3's text-grounded object localization. If Baseline 2 > Baseline 3, the contrastive Ego4D pretraining adds something the foundation models alone don't capture.
+
+**Hardware target:** 1× NVIDIA A100 80GB. **Wall clock:** ≤ 4 hours per notebook.
 
 ---
 
 ## TL;DR
 
 ```bash
-# 1. Install deps
-pip install "torch>=2.3" torchvision pillow numpy pandas pyarrow matplotlib \
-            open_clip_torch nbformat decord       # decord: optional, used for Ego4D preprocessing
-# heavyweight sim deps — only needed for actual BC rollouts
+# 1. Common deps
+pip install "torch>=2.7" torchvision pillow numpy pandas pyarrow matplotlib \
+            open_clip_torch nbformat decord       # decord optional (Ego4D preprocessing)
+
+# 2. Sim deps (needed for actual BC rollouts in either notebook)
 pip install git+https://github.com/Farama-Foundation/Metaworld.git
-# install mj_envs from R3M's fork (provides the modified Franka Kitchen + Adroit envs)
-git clone https://github.com/facebookresearch/r3m.git
-cd r3m && pip install -e . && cd ..
+git clone https://github.com/facebookresearch/r3m.git && cd r3m && pip install -e . && cd ..  # mj_envs
 
-# 2. Either:
-#    (a) point CONFIG at already-preprocessed data:
-#        CONFIG['ego4d_root'] = '/path/to/ego4d_r3m_frames'
-#        CONFIG['demo_root']  = '/path/to/r3m_demos'
-#    (b) preprocess raw Ego4D to the expected layout: enable RUN_PREPROCESSING=True
-#        in cell P2 and point P2's EGO4D_VIDEOS_DIR / EGO4D_NARRATIONS_FILE at your
-#        Ego4D download.
+# 3. Foundation-model gating (one-time)
+#    Baseline 2: DINOv3 only — request weights at https://ai.meta.com/dino-v3
+#    Baseline 3: DINOv3 + SAM 3 — request SAM 3 at https://huggingface.co/facebook/sam3, then `hf auth login`
 
-# 3. Open and run the notebook
-jupyter lab dinov2_r3m_benchmark.ipynb
-# Run all cells. Smoke tests gate the heavy production run automatically.
+# 4. SAM 3 (Baseline 3 only)
+git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e . && cd ..
+
+# 5. Run a notebook
+jupyter lab baseline_2_dinov3_lora.ipynb       # OR baseline_3_dinov3_sam3.ipynb
+# Each notebook auto-detects Colab, patches paths to Drive, runs smoke tests, then production cells.
 ```
 
 ### Running on Google Colab
 
-The notebook auto-detects Colab. Cells 5-6 mount Drive, clone the repo into `/content/`, check dependencies, and patch `CONFIG` paths so caches and the 2-hour pretrain checkpoint persist on Drive (not on Colab's ephemeral `/content/`). Just run cells in order — the Colab-specific paths are picked up automatically.
+Both notebooks auto-detect Colab. Cells 5-6 mount Drive, clone the repo into `/content/`, check dependencies, and patch `CONFIG` paths so caches and any pretrain checkpoint persist on Drive (not on Colab's ephemeral `/content/`). Just run cells in order — the Colab-specific paths are picked up automatically.
+
+### Choosing a baseline
+
+- Run **Baseline 2** first — it produces the canonical "we beat R3M with parameter-efficient adaptation" narrative and validates that demo data + sim envs work.
+- Then run **Baseline 3** to test whether the Ego4D pretraining stage was load-bearing. Baseline 3's `results/results.json` will be picked up by Baseline 2's plotting if both runs share a Drive root, and the side-by-side plot becomes a 3-way comparison.
 
 ---
 
@@ -157,7 +168,7 @@ These are produced by R3M's eval pipeline. Confirm camera names per view and pro
 
 Two modes:
 
-- **Local box**: open `dinov2_r3m_benchmark.ipynb`, edit **Cell 4 (CONFIG)** to point at your data:
+- **Local box**: open `baseline_2_dinov3_lora.ipynb`, edit **Cell 4 (CONFIG)** to point at your data:
   ```python
   CONFIG['ego4d_root'] = '/data/ego4d_r3m_frames'   # your Ego4D cache
   CONFIG['demo_root']  = '/data/r3m_demos'          # your demo .pkl tree
@@ -262,7 +273,7 @@ results/                            # the deliverable
 
 ```bash
 # re-run pretrain only (delete the checkpoint)
-rm cache/pretrain.pt && jupyter nbconvert --execute --to notebook --inplace dinov2_r3m_benchmark.ipynb
+rm cache/pretrain.pt && jupyter nbconvert --execute --to notebook --inplace baseline_2_dinov3_lora.ipynb
 
 # re-run feature extraction only (delete cached features)
 rm -rf cache/features/
@@ -277,15 +288,20 @@ rm -rf cache/features/
 
 | File | Purpose |
 |---|---|
-| `dinov2_r3m_benchmark.ipynb` | The deliverable — 37-cell runnable benchmark |
+| `baseline_2_dinov3_lora.ipynb` | Baseline 2 — 37-cell notebook (DINOv3 + LoRA + R3M-loss pretrain on Ego4D) |
+| `baseline_3_dinov3_sam3.ipynb` | Baseline 3 — 29-cell notebook (DINOv3 + SAM 3, fully frozen, no Ego4D pretrain) |
 | `ARCHITECTURE.md` | Full design document — motivation, alternatives considered per component, pros/cons, risk register |
 | `README.md` | This file — operational instructions |
-| `build_notebook.py` | Builds the notebook from a single Python source (easier to diff than raw .ipynb JSON). Run with `python3 build_notebook.py` to regenerate. |
-| `smoke_test.py` | Standalone CPU smoke test against synthetic data for the core pipeline. Independent of the notebook. |
-| `smoke_test_preprocess.py` | Standalone smoke test for `preprocess_ego4d` against synthetic mp4 + narrations.json. |
-| `run_notebook_offline.py` | Integration test that exec()s notebook cells in order with DINOv2 / pyarrow / sim deps stubbed. Used to verify the smoke section integrates cleanly with the cell definitions. |
+| `build_notebook.py` | Regenerator for baseline 2 (`python3 build_notebook.py`) |
+| `build_notebook_b3.py` | Regenerator for baseline 3 |
+| `smoke_test.py` | Standalone CPU smoke test against synthetic data for baseline 2's pipeline (DINOv3 stubbed) |
+| `smoke_test_preprocess.py` | Standalone smoke test for `preprocess_ego4d` against synthetic mp4 + narrations.json |
+| `run_notebook_offline.py` | Integration test that exec()s baseline 2's cells in order with DINOv3 / pyarrow / sim deps stubbed |
+| `run_notebook_offline_b3.py` | Integration test for baseline 3 (DINOv3 + SAM 3 + sim deps stubbed) |
 | `2203.12601v3.pdf` | The R3M paper (reference) |
 | `paper.txt` | Plain-text extract of the paper (used during development to look up exact numbers) |
+| `proposal_template (3).tex` | Original project proposal that motivated baseline 3 |
+| `milestone_template.tex` | Mid-semester milestone report |
 
 ---
 

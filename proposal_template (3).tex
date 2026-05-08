@@ -1,0 +1,96 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{times}
+\usepackage[numbers]{natbib}
+\usepackage{multicol}
+\usepackage[bookmarks=true]{hyperref}
+
+\pdfinfo{
+   /Author (Richard Li)
+   /Title  (Concept-Aware Visual Representations for Robotic Manipulation)
+   /Subject (Robotics)
+   /Keywords (R3M; DINOv3; SAM3; Robot Manipulation; Imitation Learning)
+}
+
+\begin{document}
+
+% paper title
+\title{Concept-Aware Visual Representations for Robotic Manipulation}
+
+\author{\authorblockN{Richard Li}
+\authorblockA{Columbia University  \\
+New York City, NY \\
+Email: rjl2194@columbia.edu}
+\and
+\authorblockN{Luke Yuan}
+\authorblockA{Columbia University \\
+New York City, NY \\
+Email: luke.yuan@columbia.edu}
+}
+
+\maketitle
+
+\begin{abstract}
+General-purpose robot manipulation requires visual representations that are spatially precise and semantically grounded. While models like R3M pioneered the use of human video pre-training for robotic features, they often struggle with spatial feature degradation and semantic ambiguity in cluttered scenes. We propose a hybrid vision-action stack that integrates DINOv3's dense geometric features with SAM 3's promptable concept segmentation. By replacing legacy contrastive objectives with frozen, high-fidelity foundation models, we aim to bridge the human-robot domain gap and improve the generalization of imitation learning policies in manipulation tasks.
+\end{abstract}
+
+\IEEEpeerreviewmaketitle
+
+\section{Problem Overview}
+General-purpose robotic manipulation requires visual representations that can generalize across diverse environments while maintaining the precision necessary for fine-grained motor control. Existing universal representations, such as R3M, are typically trained on human video datasets (e.g., Ego4D) using time-contrastive learning. While effective, these models face two critical challenges: 
+\begin{itemize}
+    \item \textbf{Feature Degradation at Scale:} where standard backbones fail to preserve sharp object boundaries during high-resolution tasks.
+    \item  \textbf{Semantic Ambiguity:} where the lack of object-centric awareness makes it difficult for a robot to isolate specific targets in cluttered environments. 
+\end{itemize}
+
+This project investigates whether integrating state-of-the-art models like \cite{simeoni2025dinov3} and \cite{carion2025sam3segmentconcepts} can resolve these bottlenecks. By utilizing DINOv3’s Gram Anchoring for stable, dense features and SAM 3’s concept-based masking, we propose a method to create an object-centric training process that is invariant to background noise and human-robot morphology differences.
+
+\section{Literature Review}
+The field of pre-trained visual representations (PVRs) has moved rapidly toward larger architectures and multi-modal integration. \cite{majumdar2023vc1} demonstrated with VC-1 that scaling to ViT-L backbones significantly improves performance on benchmarks like CORTEXBENCH. Other approaches, such as \cite{ma2023vipuniversalvisualreward}, have explored learning visual value functions from human videos to represent task progress. Recent work has also shifted toward generative pre-training; for instance, \cite{wu2023unleashinglargescalevideogenerative} uses large-scale video prediction to learn world dynamics for multi-task manipulation.
+
+However, many of these models still lack explicit object-level understanding. Recent 2025 breakthroughs, specifically \cite{simeoni2025dinov3}, introduce techniques to prevent feature collapse, providing superior spatial correspondence. Furthermore, \cite{carion2025sam3segmentconcepts} has evolved the "Segment Anything" task into open-vocabulary "Concept Segmentation," allowing for semantic grounding that was previously out of reach for models like R3M. Our work increments on these foundations by proposing a hybrid stack that leverages these frozen emergent properties for downstream imitation learning.
+
+\section{Proposed Method and Experiments}
+
+\subsection{Method: Hybrid Vision-Action Stack}
+We propose a policy $\pi_\theta$ that maps a multi-modal state $s_t$ to a 6-DOF action $a_t = (\Delta x, \Delta y, \Delta z, \Delta \phi, \Delta \psi, \Delta \xi) \in \mathbb{R}^6$, representing translational and rotational end-effector displacements. At each timestep, the input state $s_t$ consists of three components:
+
+\begin{itemize}
+    \item \textbf{Dense Spatial Features}: Given an RGB observation $I_t \in \mathbb{R}^{H \times W \times 3}$, we extract a dense feature map $F_t = f_{\text{DINO}}(I_t) \in \mathbb{R}^{h \times w \times d}$ from a frozen DINOv3 ViT-L/14 encoder, where $h = H/14$, $w = W/14$, and $d = 1024$. DINOv3's Gram Anchoring ensures that $F_t$ preserves high-rank spatial structure, maintaining sharp object boundaries that are critical for grasp pose estimation.
+    \item \textbf{Concept-Aware Masks}: Given a natural language task description $\ell$ (e.g., ``the red mug''), SAM 3 generates a binary concept mask $M_t = g_{\text{SAM}}(I_t, \ell) \in \{0, 1\}^{h \times w}$, which localizes the task-relevant object at the feature-map resolution. This mask is applied element-wise to produce filtered features $\hat{F}_t = F_t \odot M_t$, zeroing out background and distractor activations.
+    \item \textbf{Proprioception}: The robot's current joint configuration $q_t \in \mathbb{R}^{7}$ and end-effector pose $p_t \in SE(3)$, represented as a 7-dimensional vector (3D position + quaternion orientation).
+\end{itemize}
+
+The masked feature map $\hat{F}_t$ is spatially pooled via global average pooling to produce a compact visual embedding $z_t^{\text{vis}} \in \mathbb{R}^d$. This is concatenated with the proprioceptive state $z_t^{\text{prop}} \in \mathbb{R}^{14}$ and passed through a 3-layer MLP with ReLU activations and layer normalization:
+\begin{equation}
+    a_t = \pi_\theta(z_t^{\text{vis}} \oplus z_t^{\text{prop}})
+\end{equation}
+where $\oplus$ denotes concatenation. The policy is trained via behavioral cloning on expert demonstrations $\mathcal{D} = \{(s_i, a_i)\}_{i=1}^{N}$, minimizing the MSE loss:
+\begin{equation}
+    \mathcal{L}(\theta) = \frac{1}{N} \sum_{i=1}^{N} \| \pi_\theta(s_i) - a_i \|_2^2
+\end{equation}
+
+Critically, both $f_{\text{DINO}}$ and $g_{\text{SAM}}$ remain frozen during training; only the MLP policy head $\pi_\theta$ is optimized. This design choice preserves the pre-trained spatial and semantic fidelity of the foundation models, avoids catastrophic forgetting, and dramatically reduces the number of trainable parameters (approximately 2M for the MLP versus 300M+ for the encoders), enabling efficient learning from as few as 50 demonstrations.
+
+\subsection{Experiments}
+We will evaluate our method in simulation using NVIDIA Isaac Gym or \cite{zhu2025robosuitemodularsimulationframework}.
+\begin{itemize}
+    \item \textbf{Quantitative}: We will measure the Success Rate (SR) across multiple tasks (e.g., "Pick and Place," "Drawer Opening") and compare our stack against R3M and VC-1 baselines.
+    \item \textbf{Qualitative}: We will visualize attention maps to verify if the policy accurately focuses on the targeted semantic concepts during execution.
+\end{itemize}
+
+\section{Milestones and Timeline}
+\begin{itemize}
+    \item \textbf{Feb 12 – Feb 26}: Setup simulation environments and implement vanilla R3M as a performance baseline.
+    \item \textbf{Feb 27 – Mar 26}: Integrate DINOv3 and SAM 3 encoders; collect ~50 demonstrations via teleoperation.
+    \item \textbf{Mar 27 (Milestone)}: Achieve successful execution of a single-task manipulation using the hybrid stack.
+    \item \textbf{Mar 28 – Apr 23}: Perform multi-task training and generalization tests across varied background noise.
+    \item \textbf{Apr 24 – May 7}: Conduct ablation studies (e.g., DINOv2 vs. DINOv3) and finalize the report.
+\end{itemize}
+
+\section{Team Background}
+The team consists of Richard Li and Luke Yuan, both students at Columbia University with backgrounds in Computer Science and Mathematics. Richard has previously worked as a research intern at Microsoft and an AI intern at Toonsutra, with experience in modifying CLIP and DINO models. Luke has previously worked at the Johns Hopkins Applied Physics Laboratory, with experience in deploying VLM's and RAG LLM's at scale.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
