@@ -11,21 +11,29 @@ A reproducible benchmark pitting a parameter-efficient DINOv2 + LoRA + CLIP-text
 ```bash
 # 1. Install deps
 pip install "torch>=2.3" torchvision pillow numpy pandas pyarrow matplotlib \
-            open_clip_torch nbformat
+            open_clip_torch nbformat decord       # decord: optional, used for Ego4D preprocessing
 # heavyweight sim deps — only needed for actual BC rollouts
 pip install git+https://github.com/Farama-Foundation/Metaworld.git
 # install mj_envs from R3M's fork (provides the modified Franka Kitchen + Adroit envs)
 git clone https://github.com/facebookresearch/r3m.git
 cd r3m && pip install -e . && cd ..
 
-# 2. Set the two data paths in CONFIG (Cell 4 of the notebook):
-#       CONFIG['ego4d_root']  = '/path/to/ego4d_r3m_frames'
-#       CONFIG['demo_root']   = '/path/to/r3m_demos'
+# 2. Either:
+#    (a) point CONFIG at already-preprocessed data:
+#        CONFIG['ego4d_root'] = '/path/to/ego4d_r3m_frames'
+#        CONFIG['demo_root']  = '/path/to/r3m_demos'
+#    (b) preprocess raw Ego4D to the expected layout: enable RUN_PREPROCESSING=True
+#        in cell P2 and point P2's EGO4D_VIDEOS_DIR / EGO4D_NARRATIONS_FILE at your
+#        Ego4D download.
 
 # 3. Open and run the notebook
 jupyter lab dinov2_r3m_benchmark.ipynb
 # Run all cells. Smoke tests gate the heavy production run automatically.
 ```
+
+### Running on Google Colab
+
+The notebook auto-detects Colab. Cells 5-6 mount Drive, clone the repo into `/content/`, check dependencies, and patch `CONFIG` paths so caches and the 2-hour pretrain checkpoint persist on Drive (not on Colab's ephemeral `/content/`). Just run cells in order — the Colab-specific paths are picked up automatically.
 
 ---
 
@@ -54,9 +62,10 @@ results/
 | `torchvision` | image transforms |
 | `pillow` | JPEG load + resize (uses `Image.Resampling.BICUBIC`) |
 | `numpy`, `pandas` | manifest handling, aggregation |
-| `pyarrow` | reads `manifest.parquet` (R3M's preprocess output) |
+| `pyarrow` | reads/writes `manifest.parquet` |
 | `matplotlib` | side-by-side bars, training curves |
 | `open_clip_torch` | CLIP `ViT-B-32-quickgelu` (must be the `-quickgelu` variant for `pretrained='openai'`) |
+| `decord` | optional — fast video decoder used by Ego4D preprocessing. Falls back to `opencv-python` if not installed. |
 | `nbformat` | optional, only for re-validating the notebook |
 
 ### Sim dependencies (only needed for BC rollouts in the production run)
@@ -75,7 +84,7 @@ The smoke tests stub the simulator and **do not require either of these** — us
 
 ## Required data
 
-The notebook does **not** download Ego4D or generate the demo data. Both are preconditions, not part of the 4 h budget.
+The notebook does **not** download Ego4D or generate the demo data. Ego4D access requires registration at https://ego4d-data.org. The demo `.pkl` files come from R3M's eval pipeline.
 
 ### 1. Ego4D pre-extracted frames
 
@@ -94,7 +103,20 @@ ego4d_root/
 │   ...
 ```
 
-Produced by R3M's `preprocess_ego4d.py` (see `facebookresearch/r3m`). If the manifest has `n_frames > 5`, the dataset class re-samples per epoch using R3M's sampling rule; if `n_frames == 5`, frames are used as-is.
+R3M's repo does **not** ship a preprocessing script — their README says the dataset is assumed to already be parsed into frames. Two options:
+
+**Option A: you already have the frames cached** (e.g. from a prior R3M run). Point `CONFIG['ego4d_root']` at the directory and skip the preprocessing cells (`RUN_PREPROCESSING = False`, the default).
+
+**Option B: preprocess raw Ego4D in the notebook.** Cells P0-P3 (just after Cell 4) handle this:
+1. Download raw Ego4D via the [Ego4D CLI](https://github.com/facebookresearch/Ego4d) after registering: `ego4d --output_directory <data_root> --datasets full_scale annotations`. You get `<data_root>/v2/full_scale/<video_uid>.mp4` and `<data_root>/v2/annotations/narrations.json`.
+2. Set `EGO4D_VIDEOS_DIR` and `EGO4D_NARRATIONS_FILE` in cell P2.
+3. Set `RUN_PREPROCESSING = True` in cell P2.
+4. Set `subset_n=50000` (or larger if you have more time/disk). Full Ego4D (~5M narrations) is 1-2 weeks of single-process work; 50k narrations on Colab CPU is ~40-90 min.
+5. Run cells P0 (clone R3M for reference) → P1 (define preprocess function) → P2 (run) → P3 (validate).
+
+Preprocessing is idempotent — re-running with `skip_existing=True` (default) picks up where it left off, so a Colab session disconnect mid-preprocessing only loses the current `log_every`-clip checkpoint window. Output is written incrementally; the manifest is checkpointed every 500 clips.
+
+The preprocessor uses `decord` for fast random-access video decoding; if `decord` isn't installed (e.g. on arm64 Mac), it falls back to OpenCV per-frame seek (~3× slower but portable).
 
 ### 2. R3M demo episodes
 
@@ -133,14 +155,20 @@ These are produced by R3M's eval pipeline. Confirm camera names per view and pro
 
 ### Step 1 — set paths
 
-Open `dinov2_r3m_benchmark.ipynb`, scroll to **Cell 4 (CONFIG)**, set:
+Two modes:
 
-```python
-CONFIG['ego4d_root'] = '/data/ego4d_r3m_frames'   # your Ego4D cache
-CONFIG['demo_root']  = '/data/r3m_demos'          # your demo .pkl tree
-```
+- **Local box**: open `dinov2_r3m_benchmark.ipynb`, edit **Cell 4 (CONFIG)** to point at your data:
+  ```python
+  CONFIG['ego4d_root'] = '/data/ego4d_r3m_frames'   # your Ego4D cache
+  CONFIG['demo_root']  = '/data/r3m_demos'          # your demo .pkl tree
+  ```
+- **Google Colab**: just run cells in order. Cells 5-6 auto-mount Drive and patch `CONFIG` paths to `/content/drive/MyDrive/cs6998-final-proj-data/...`. Edit those defaults in cell 6 if your Drive layout differs.
 
 Optionally set `CONFIG['cut_level']` (0=full, 1=drop Adroit, 2=demo sizes 3→2, 3=seeds 3→2, 4=drop view 3, 5=pretrain 150k→100k). Default is 1.
+
+### Step 1.5 — preprocess Ego4D (only if needed)
+
+Skip if you already have `<ego4d_root>/manifest.parquet` + `<clip_uid>/{0..4}.jpg`. Otherwise see the "Option B: preprocess raw Ego4D in the notebook" path under **Required data** above.
 
 ### Step 2 — run smoke tests first
 
@@ -158,12 +186,12 @@ Once smoke passes, run cells in order. Each stage is independently re-runnable:
 
 | Cell | Stage | Skip condition |
 |---|---|---|
-| 25 (PROD 1) | CLIP text cache (3-5 min) | `cache/clip_text_embeds.pt` exists |
-| 26 (PROD 2) | Pretrain (~2.0-2.3 h) | `cache/pretrain.pt` exists |
-| 27 (PROD 3) | Feature extraction (~10-15 min) | per-(task, view) cache hit |
-| 28 (PROD 4) | BC sweep (~60-80 min) | always runs |
-| 29 (PROD 5) | Aggregation + plots | always runs |
-| 30 (PROD 6) | Markdown summary | always runs |
+| 32 (PROD 1) | CLIP text cache (3-5 min) | `cache/clip_text_embeds.pt` exists |
+| 33 (PROD 2) | Pretrain (~2.0-2.3 h) | `cache/pretrain.pt` exists |
+| 34 (PROD 3) | Feature extraction (~10-15 min) | per-(task, view) cache hit |
+| 35 (PROD 4) | BC sweep (~60-80 min) | always runs |
+| 36 (PROD 5) | Aggregation + plots | always runs |
+| 37 (PROD 6) | Markdown summary | always runs |
 
 To force a re-run of any stage, delete its cache file. To skip the smoke tests on subsequent runs, set `RUN_SMOKE_TESTS = False` in Cell 21.
 
@@ -215,7 +243,9 @@ results/                            # the deliverable
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `FileNotFoundError: manifest.parquet` | `CONFIG['ego4d_root']` wrong or no preprocessing run | re-check path; run R3M's `preprocess_ego4d.py` |
+| `FileNotFoundError: manifest.parquet` | `CONFIG['ego4d_root']` wrong or no preprocessing run | re-check path; or set `RUN_PREPROCESSING=True` in cell P2 to preprocess in-notebook |
+| `decord` install fails on arm64 Mac | no prebuilt wheel | the preprocessor falls back to OpenCV automatically; or skip preprocessing locally and run only on Linux/Colab |
+| Preprocessing slow (>200 ms/clip) | OpenCV fallback being used | `pip install decord` for ~3× speedup on Linux/Colab |
 | `KeyError` in MetaWorld env lookup | env name strings differ across MetaWorld versions | the cell tries both `ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE` and `ALL_V2_ENVIRONMENTS`; if both miss, check your installed metaworld version's keys |
 | Black/zero rendered frames | wrong camera name for the view | edit `view_to_camera` in Cell 15; visual-check first frame |
 | `ImportError: pyarrow` lib not loaded | broken pyarrow install | `pip install --force-reinstall pyarrow` |
@@ -247,11 +277,12 @@ rm -rf cache/features/
 
 | File | Purpose |
 |---|---|
-| `dinov2_r3m_benchmark.ipynb` | The deliverable — 30-cell runnable benchmark |
+| `dinov2_r3m_benchmark.ipynb` | The deliverable — 37-cell runnable benchmark |
 | `ARCHITECTURE.md` | Full design document — motivation, alternatives considered per component, pros/cons, risk register |
 | `README.md` | This file — operational instructions |
 | `build_notebook.py` | Builds the notebook from a single Python source (easier to diff than raw .ipynb JSON). Run with `python3 build_notebook.py` to regenerate. |
-| `smoke_test.py` | Standalone CPU smoke test against synthetic data (the test I ran during development). Independent of the notebook. |
+| `smoke_test.py` | Standalone CPU smoke test against synthetic data for the core pipeline. Independent of the notebook. |
+| `smoke_test_preprocess.py` | Standalone smoke test for `preprocess_ego4d` against synthetic mp4 + narrations.json. |
 | `run_notebook_offline.py` | Integration test that exec()s notebook cells in order with DINOv2 / pyarrow / sim deps stubbed. Used to verify the smoke section integrates cleanly with the cell definitions. |
 | `2203.12601v3.pdf` | The R3M paper (reference) |
 | `paper.txt` | Plain-text extract of the paper (used during development to look up exact numbers) |

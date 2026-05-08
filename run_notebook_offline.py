@@ -9,6 +9,7 @@ Before running, stub:
 We skip the PROD cells (5 of them at the end) because they hit real Ego4D paths.
 """
 import sys, json, types, torch, torch.nn as nn, pickle
+from pathlib import Path
 
 # ---- stub pyarrow.parquet (broken install on this Mac; Linux/A100 box has it) ----
 # We back the stub with pandas read/write of a pickle file at the same path.
@@ -23,6 +24,10 @@ def _fake_read_table(path):
 
 _fake_pq = types.ModuleType('pyarrow.parquet'); _fake_pq.read_table = _fake_read_table
 _fake_pa = types.ModuleType('pyarrow'); _fake_pa.parquet = _fake_pq
+# Give stubs a __spec__ so importlib.util.find_spec() works on them
+import importlib.machinery as _machinery
+_fake_pa.__spec__ = _machinery.ModuleSpec('pyarrow', None)
+_fake_pq.__spec__ = _machinery.ModuleSpec('pyarrow.parquet', None)
 sys.modules['pyarrow'] = _fake_pa
 sys.modules['pyarrow.parquet'] = _fake_pq
 
@@ -79,6 +84,18 @@ def _patched_hub_load(*args, **kwargs):
         return FakeDinov2()
     return _orig_hub_load(*args, **kwargs)
 torch.hub.load = _patched_hub_load
+
+# ---- stub subprocess.run so the P0 git-clone-r3m-reference cell doesn't actually clone ----
+import subprocess as _sp_real
+_orig_run = _sp_real.run
+def _patched_run(args, *a, **kw):
+    if args and 'git' in str(args[0]) and 'clone' in (args[1] if len(args) > 1 else ''):
+        print(f"[stubbed] git clone: {args}")
+        # Create empty target dir so the existence check is satisfied
+        if len(args) >= 4: Path(args[-1]).mkdir(parents=True, exist_ok=True)
+        return _sp_real.CompletedProcess(args, 0)
+    return _orig_run(args, *a, **kw)
+_sp_real.run = _patched_run
 
 # ---- Read notebook, extract code cells ----
 nb = json.load(open('dinov2_r3m_benchmark.ipynb'))

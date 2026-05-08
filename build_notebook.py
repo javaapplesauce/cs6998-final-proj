@@ -221,6 +221,343 @@ print(f"[setup] cut_level={CONFIG['cut_level']}, pretrain_steps={CONFIG['pretrai
 
 
 # ============================================================
+# Cell 3.5 — Colab / Drive setup (optional, runs only on Colab)
+# ============================================================
+md("""---
+
+## Optional: Colab / Drive setup
+
+If you're running on Google Colab, run the next cell to mount Drive, clone the
+project repo, check dependencies, and override `CONFIG` paths so caches land on
+Drive (so a Colab session disconnect doesn't destroy your 2-hour pretrain
+checkpoint). On a non-Colab box, the cell auto-detects and is a near no-op —
+you only need to set `DRIVE_ROOT` if you don't want the default `/mnt/drive`.
+
+**Skip this cell** if you're running locally with the default paths in `CONFIG`
+already pointing at where your data lives.
+""")
+
+code("""# ===== Colab setup: mount Drive, clone repo, check deps, patch CONFIG paths =====
+# Idempotent: safe to re-run. Patches CONFIG paths in place; does NOT redefine
+# CONFIG (which would clobber 60+ hyperparameters from Cell 3).
+import os, sys, subprocess, importlib.util
+from pathlib import Path
+
+try:
+    from google.colab import drive
+    drive.mount('/content/drive', force_remount=False)
+    DRIVE_ROOT = Path('/content/drive/MyDrive')
+    IN_COLAB = True
+except ImportError:
+    DRIVE_ROOT = Path('/mnt/drive')   # TODO: confirm for non-Colab boxes
+    IN_COLAB  = False
+    print(f"[info] not in Colab — DRIVE_ROOT={DRIVE_ROOT}")
+
+# Clone repo into ephemeral /content (small-file I/O is slow on Drive)
+REPO_DIR = Path('/content/cs6998-final-proj') if IN_COLAB else Path.cwd()
+if IN_COLAB and not REPO_DIR.exists():
+    subprocess.run(['git', 'clone',
+                    'https://github.com/javaapplesauce/cs6998-final-proj',
+                    str(REPO_DIR)], check=True)
+elif IN_COLAB:
+    print(f"[info] {REPO_DIR} exists — `!git -C {REPO_DIR} pull` to update")
+sys.path.insert(0, str(REPO_DIR))
+
+# Dependency presence check (find_spec, no actual import)
+REQUIRED = {'torch':'torch>=2.3','torchvision':'torchvision','PIL':'pillow',
+            'numpy':'numpy','pandas':'pandas','pyarrow':'pyarrow',
+            'matplotlib':'matplotlib','open_clip':'open_clip_torch','nbformat':'nbformat'}
+missing = [pkg for mod, pkg in REQUIRED.items() if importlib.util.find_spec(mod) is None]
+if missing:
+    print(f"[warn] missing — install before continuing:  pip install {' '.join(missing)}")
+else:
+    print("[ok] core packages present")
+for sim in ('mj_envs', 'metaworld'):
+    if importlib.util.find_spec(sim) is None:
+        print(f"[warn] {sim} not importable — required for production BC sweep only")
+    else:
+        print(f"[ok] {sim} importable")
+
+# Patch CONFIG paths to land on Drive (preserves all other hyperparameters).
+# Only patches when DRIVE_ROOT is actually accessible — otherwise leaves the
+# Cell 3 defaults so this cell stays a no-op on non-Colab boxes.
+if IN_COLAB or DRIVE_ROOT.exists():
+    DATA_ROOT = DRIVE_ROOT / 'cs6998-final-proj-data'   # TODO: confirm staging dir
+    RUNS_ROOT = DRIVE_ROOT / 'cs6998-final-proj-runs'   # caches + results persist here
+    CONFIG.update({
+        'repo_root':     str(REPO_DIR),
+        'ego4d_root':    str(DATA_ROOT / 'ego4d_frames'),    # TODO: confirm
+        'demo_root':     str(DATA_ROOT / 'r3m_demos'),       # TODO: confirm
+        'cache_dir':     str(RUNS_ROOT / 'cache'),
+        'results_dir':   str(RUNS_ROOT / 'results'),
+        'pretrain_ckpt': str(RUNS_ROOT / 'cache' / 'pretrain.pt'),
+    })
+    Path(CONFIG['cache_dir']).mkdir(parents=True, exist_ok=True)
+    Path(CONFIG['results_dir']).mkdir(parents=True, exist_ok=True)
+    print("\\n[ok] CONFIG paths patched to Drive:")
+    for k in ('repo_root','ego4d_root','demo_root','cache_dir','results_dir','pretrain_ckpt'):
+        print(f"  {k}: {CONFIG[k]}")
+else:
+    print(f"\\n[info] DRIVE_ROOT={DRIVE_ROOT} not accessible — leaving Cell 3 defaults intact.")
+    print("       Set CONFIG['ego4d_root'] / CONFIG['demo_root'] manually if running locally.")
+""")
+
+
+# ============================================================
+# Cell 3.6 — Ego4D preprocessing (optional)
+# ============================================================
+md("""---
+
+## Optional: Ego4D preprocessing
+
+R3M's repo does **not** ship a preprocessing script — their README says
+"the dataset has been parsed into frames" and assumes you've done it yourself.
+If you already have `<ego4d_root>/manifest.parquet` + `<clip_uid>/{0..4}.jpg`,
+**skip this section** and continue to Cell 4 (Logger).
+
+If you have raw Ego4D `.mp4` videos + `narrations.json` and need to produce
+the layout the rest of the notebook expects, run cells P0-P3 below. Their
+behavior is gated by `RUN_PREPROCESSING` — set it to `False` to skip.
+
+**Inputs needed (download via Ego4D CLI after registering at https://ego4d-data.org):**
+- a directory of `<video_uid>.mp4` files
+- the `narrations.json` annotation file
+
+**Output:** `CONFIG['ego4d_root']/<clip_uid>/{0..4}.jpg` + `manifest.parquet`,
+ready to be consumed by `Ego4DR3MDataset` (Cell 6).
+
+**Wall-clock:** ~50-100 ms per clip on a Colab CPU. Full Ego4D (~5M narrations)
+is days; subset to 50k-100k for a single-session run. The `subset_n` knob in
+P2 is the budget control.
+""")
+
+code("""# ===== P0: clone R3M for reference (their data_loaders.py is the source-of-truth on sampling) =====
+import subprocess
+from pathlib import Path
+
+R3M_REF = Path('/content/r3m_reference') if 'IN_COLAB' in globals() and IN_COLAB else Path('./r3m_reference')
+if not R3M_REF.exists():
+    subprocess.run(['git', 'clone', '--depth', '1',
+                    'https://github.com/facebookresearch/r3m.git', str(R3M_REF)], check=True)
+    print(f"R3M cloned at {R3M_REF}")
+else:
+    print(f"R3M already present at {R3M_REF}")
+print("R3M's preprocessing is NOT shipped (see their README line 34).")
+print(f"Reference loader (sampling logic): {R3M_REF}/r3m/utils/data_loaders.py")
+""")
+
+code("""# ===== P1: define preprocess_ego4d (replicates R3M's clip-around-narration logic) =====
+# Tries decord (fast, random-access). Falls back to OpenCV if decord isn't available
+# (e.g. arm64 Mac). decord is the recommended path on Linux/Colab.
+import json, random, time
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+def _open_video_decoder(path):
+    \"\"\"Returns (reader, fps, n_frames, get_frames_fn). decord first, cv2 fallback.\"\"\"
+    try:
+        import decord
+        decord.bridge.set_bridge('native')
+        vr = decord.VideoReader(str(path))
+        fps = float(vr.get_avg_fps()); n = len(vr)
+        def get_frames(indices):
+            return vr.get_batch(list(indices)).asnumpy()
+        return vr, fps, n, get_frames
+    except ImportError:
+        import cv2
+        cap = cv2.VideoCapture(str(path))
+        if not cap.isOpened():
+            raise RuntimeError(f"cv2 failed to open {path}")
+        fps = float(cap.get(cv2.CAP_PROP_FPS))
+        n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        def get_frames(indices):
+            out = []
+            for idx in indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+                ok, frame = cap.read()
+                if not ok: raise RuntimeError(f"cv2 failed to read frame {idx}")
+                out.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            return np.stack(out, axis=0)
+        return cap, fps, n, get_frames
+
+def _close_video(reader):
+    if hasattr(reader, 'release'):
+        reader.release()
+
+def preprocess_ego4d(
+    videos_dir, narrations_json, output_dir, *,
+    image_size=224, clip_window_sec=4.0,
+    narration_pass='narration_pass_1', only_camera_wearer=True,
+    subset_n=None, skip_existing=True, log_every=500,
+):
+    \"\"\"
+    For each Ego4D narration: carve a window of ±clip_window_sec around the timestamp;
+    sample 5 frames using R3M's rule (I0 from first 20%, Ig from last 20%, Ii<Ij<Ik
+    in between); resize to image_size; save as <output_dir>/<clip_uid>/{0..4}.jpg.
+    Append (clip_uid, narration, n_frames=5) rows to <output_dir>/manifest.parquet.
+    Idempotent: re-running with skip_existing=True picks up where it left off.
+    \"\"\"
+    videos_dir = Path(videos_dir); output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_dir / 'manifest.parquet'
+
+    print(f"[load] {narrations_json}")
+    narrations_data = json.loads(Path(narrations_json).read_text())
+    print(f"  {len(narrations_data):,} videos in narrations.json")
+
+    flat = []
+    for video_uid, vdata in narrations_data.items():
+        if narration_pass not in vdata: continue
+        for k, n in enumerate(vdata[narration_pass].get('narrations', [])):
+            text = (n.get('narration_text') or '').strip()
+            if only_camera_wearer and not text.startswith('#C'): continue
+            ts = n.get('timestamp_sec')
+            if ts is None: continue
+            flat.append({'video_uid': video_uid, 'timestamp_sec': float(ts),
+                         'narration_text': text,
+                         'annotation_uid': n.get('annotation_uid') or f"idx{k:08d}"})
+    print(f"  {len(flat):,} narrations after filtering")
+    if subset_n is not None:
+        flat = flat[:subset_n]
+        print(f"  subset_n={subset_n}: processing {len(flat):,}")
+
+    rows, existing_uids = [], set()
+    if manifest_path.exists() and skip_existing:
+        existing = pd.read_parquet(manifest_path)
+        rows = existing.to_dict('records')
+        existing_uids = set(existing['clip_uid'].tolist())
+        print(f"  resuming: {len(existing_uids):,} clips already done")
+
+    n_done = len(existing_uids); n_skip = 0; n_fail = 0
+    last_uid, reader, fps, n_video_frames, get_frames = None, None, None, None, None
+    t0 = time.time()
+
+    try:
+        for i, item in enumerate(flat):
+            video_uid = item['video_uid']
+            clip_uid = f"{video_uid}_{item['annotation_uid']}_{int(item['timestamp_sec']*1000):010d}"
+            if clip_uid in existing_uids: n_skip += 1; continue
+            clip_dir = output_dir / clip_uid
+            if (clip_dir / '4.jpg').exists():
+                existing_uids.add(clip_uid); n_skip += 1; continue
+
+            try:
+                if video_uid != last_uid:
+                    if reader is not None: _close_video(reader)
+                    cands = sorted(videos_dir.glob(f"{video_uid}.*"))
+                    if not cands: n_fail += 1; continue
+                    reader, fps, n_video_frames, get_frames = _open_video_decoder(cands[0])
+                    last_uid = video_uid
+
+                t_lo = max(0.0, item['timestamp_sec'] - clip_window_sec)
+                t_hi = min(n_video_frames / fps, item['timestamp_sec'] + clip_window_sec)
+                f_lo = int(t_lo * fps); f_hi = min(n_video_frames - 1, int(t_hi * fps))
+                n_clip = f_hi - f_lo + 1
+                if n_clip < 5: n_fail += 1; continue
+
+                first20 = max(1, n_clip // 5); last20 = max(1, n_clip // 5)
+                i0 = random.randint(0, first20 - 1)
+                ig = random.randint(n_clip - last20, n_clip - 1)
+                lo, hi = i0 + 1, ig - 1
+                if hi - lo + 1 < 3:
+                    mids = sorted([random.randint(lo, hi) for _ in range(3)]) if hi >= lo else [i0]*3
+                else:
+                    mids = sorted(random.sample(range(lo, hi + 1), 3))
+                video_indices = [f_lo + ci for ci in (i0, mids[0], mids[1], mids[2], ig)]
+
+                frames = get_frames(video_indices)
+                clip_dir.mkdir(parents=True, exist_ok=True)
+                for j, frame in enumerate(frames):
+                    Image.fromarray(frame).resize(
+                        (image_size, image_size), Image.Resampling.BICUBIC
+                    ).save(clip_dir / f"{j}.jpg", quality=85)
+
+                rows.append({'clip_uid': clip_uid,
+                             'narration': item['narration_text'],
+                             'n_frames': 5})
+                n_done += 1
+            except Exception as e:
+                n_fail += 1
+                if n_fail < 10: print(f"  fail [{i}]: {type(e).__name__}: {e}")
+
+            if (i + 1) % log_every == 0:
+                elapsed = time.time() - t0
+                eta = elapsed / (i + 1) * (len(flat) - i - 1) / 60
+                pd.DataFrame(rows).to_parquet(manifest_path)
+                print(f"  [{i+1:,}/{len(flat):,}] done={n_done:,} skip={n_skip:,} "
+                      f"fail={n_fail:,} eta={eta:.1f}min")
+    finally:
+        if reader is not None: _close_video(reader)
+
+    pd.DataFrame(rows).to_parquet(manifest_path)
+    print(f"\\n[done] {n_done:,} clips written, {n_skip:,} skipped, {n_fail:,} failed")
+    print(f"  manifest: {manifest_path}")
+    return manifest_path
+""")
+
+code("""# ===== P2: run preprocessing (gated by RUN_PREPROCESSING) =====
+RUN_PREPROCESSING = False    # set True to run; False to skip if your data is already preprocessed
+
+# Where your raw Ego4D inputs live. Get these via the Ego4D CLI after registering
+# (https://ego4d-data.org). The CLI command is roughly:
+#   ego4d --output_directory <data_root> --datasets full_scale annotations
+EGO4D_VIDEOS_DIR      = (Path(CONFIG['repo_root']).parent if 'repo_root' in CONFIG else Path('.')) / 'ego4d_raw_videos'   # TODO: confirm
+EGO4D_NARRATIONS_FILE = (Path(CONFIG['repo_root']).parent if 'repo_root' in CONFIG else Path('.')) / 'narrations.json'    # TODO: confirm
+
+if RUN_PREPROCESSING:
+    # subset_n caps the work. Full Ego4D (~5M narrations) is 1-2 weeks single-process.
+    # 50k narrations on Colab CPU ~ 40-90 min. None = full set (only with cluster compute).
+    preprocess_ego4d(
+        videos_dir=EGO4D_VIDEOS_DIR,
+        narrations_json=EGO4D_NARRATIONS_FILE,
+        output_dir=CONFIG['ego4d_root'],
+        subset_n=50_000,                   # tune for your time/disk budget
+        image_size=CONFIG['image_size'],
+        clip_window_sec=4.0,
+        narration_pass='narration_pass_1',
+        only_camera_wearer=True,
+    )
+else:
+    print("RUN_PREPROCESSING=False — skipping. Set True if you need to preprocess.")
+""")
+
+code("""# ===== P3: validate preprocessed data is consumable =====
+manifest_path = Path(CONFIG['ego4d_root']) / 'manifest.parquet'
+if not manifest_path.exists():
+    print(f"[warn] {manifest_path} does not exist yet — preprocessing or staging needed.")
+    print("       The Ego4D-dependent cells (CLIP cache, pretrain) will fail until this is fixed.")
+else:
+    m = pd.read_parquet(manifest_path)
+    assert {'clip_uid', 'narration', 'n_frames'}.issubset(m.columns), m.columns.tolist()
+    assert (m['n_frames'] >= 5).all(), "found clips with <5 frames"
+    print(f"[ok] manifest: {len(m):,} clips, "
+          f"{m['narration'].nunique():,} unique narrations, "
+          f"avg narration length {m['narration'].str.len().mean():.1f} chars")
+    # Spot-check first clip
+    first_uid = m.iloc[0]['clip_uid']
+    clip_dir = Path(CONFIG['ego4d_root']) / first_uid
+    for j in range(5):
+        f = clip_dir / f"{j}.jpg"
+        if not f.exists():
+            print(f"[warn] missing {f}"); break
+        im = Image.open(f); assert im.size == (CONFIG['image_size'], CONFIG['image_size']), im.size
+    else:
+        print(f"[ok] first clip {first_uid}: 5/5 frames present at "
+              f"{CONFIG['image_size']}x{CONFIG['image_size']}")
+
+# Validate demo_root exists too — the BC sweep needs this
+demo_root = Path(CONFIG['demo_root'])
+if not demo_root.exists():
+    print(f"[warn] CONFIG['demo_root']={demo_root} not found — BC sweep will be skipped.")
+else:
+    n_envs = sum(1 for _ in demo_root.iterdir() if _.is_dir())
+    print(f"[ok] demo_root has {n_envs} env subdirs")
+""")
+
+
+# ============================================================
 # Cell 4 — logger
 # ============================================================
 code("""# ===== CELL 4: dual logger (stdout + results.json) =====

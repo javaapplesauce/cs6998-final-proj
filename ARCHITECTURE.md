@@ -225,7 +225,13 @@ Every hyperparameter — paths, model dims, LoRA rank, λ values, BC protocol, e
 
 ### 4.4 Ego4D dataset: pre-extracted JPEG cache vs. live video decoding
 
-We assume `<clip_uid>/{0..4}.jpg` + `manifest.parquet` already exists. Live video decoding from `.mp4` would be **~100× slower** at the I/O level: each `__getitem__` would seek into a video file, decode N frames, and copy them out. Pre-extracted frames let the kernel cache them and let the OS prefetch sequentially.
+The training pipeline reads from `<clip_uid>/{0..4}.jpg` + `manifest.parquet` — a layout produced by the in-notebook `preprocess_ego4d` function (cells P0-P3). Live video decoding from `.mp4` would be **~100× slower** at the I/O level: each `__getitem__` would seek into a video file, decode N frames, and copy them out. Pre-extracted frames let the kernel cache them and let the OS prefetch sequentially.
+
+**Why we ship our own preprocessing instead of running R3M's:** R3M's repo doesn't include a preprocessing script — their README explicitly states "the dataset has been parsed into frames" and assumes the user has done it. Our `preprocess_ego4d` function reads `narrations.json` (Ego4D's annotation file), filters to `#C` (camera-wearer) narrations, carves a `±clip_window_sec` window around each narration's `timestamp_sec`, and applies R3M's exact 5-frame sampling rule. The output schema (column names, frame layout, JPEG quality) matches what `Ego4DR3MDataset` expects.
+
+**Decoder choice:** the function tries `decord` (single-pass, random access) first; falls back to OpenCV (per-frame seek) if decord isn't available. decord is the recommended path on Linux/Colab (`pip install decord`); OpenCV is the portability fallback for arm64 Mac and other platforms without decord wheels. OpenCV is ~3× slower for random-access decoding because each `cap.set(CAP_PROP_POS_FRAMES, idx)` re-seeks rather than streaming, but it works everywhere.
+
+**Idempotency:** the function checks `manifest.parquet` and `<clip_uid>/4.jpg` before reprocessing each clip. Killing and resuming is safe; a Colab disconnect mid-preprocessing only loses the current 500-clip checkpoint window (set by `log_every`).
 
 **Pros of pre-extracted cache:**
 - Fast random access; persistent across runs.
@@ -439,6 +445,18 @@ Sets the comparison contract upfront. The bottleneck table forces the reader to 
 
 **Decision: bf16 over fp16.** bf16 has the same exponent range as fp32 — no `GradScaler` needed, no Inf/NaN dance. Dynamic-range issues that plague fp16 contrastive losses (TCN's neg-L2 over many samples can produce large gradients) just disappear with bf16. A100 has full bf16 throughput.
 
+### Cells 5-6 (Colab / Drive setup, optional)
+A single optional cell that auto-detects Colab, mounts Drive, clones the project repo into `/content/` (small-file I/O is much faster on `/content/` than on Drive), checks dependencies, and **patches** `CONFIG` paths to point at Drive — so caches and the 2-hour pretrain checkpoint survive Colab session disconnects. The cell is a no-op on non-Colab boxes where `DRIVE_ROOT` doesn't exist; the user keeps Cell 4's defaults. `CONFIG.update(...)` is used (not reassignment), so the 60+ hyperparameters from Cell 4 are preserved.
+
+### Cells 7-11 (Ego4D preprocessing, optional, gated)
+R3M's repo doesn't ship a preprocessing script — their README explicitly states the dataset is assumed to be already parsed into frames. We replicate equivalent behavior:
+- **P0** (cell 8): clones R3M's repo for reference. Their `r3m/utils/data_loaders.py` is the source-of-truth on the 5-frame sampling rule. The clone is informational only.
+- **P1** (cell 9): defines `preprocess_ego4d(...)`. Reads `narrations.json`, filters to `#C` (camera-wearer) narrations, opens videos with `decord` (fallback: OpenCV per-frame seek), carves `±clip_window_sec` windows around each `timestamp_sec`, applies R3M's 5-frame sampling rule (I0 from first 20%, Ig from last 20%, Ii<Ij<Ik in between), resizes to 224×224, writes JPEGs and `manifest.parquet`.
+- **P2** (cell 10): gated by `RUN_PREPROCESSING = False` (default). When set to True, runs preprocessing on the first `subset_n` narrations (default 50,000 — full Ego4D is 1-2 weeks of single-process work).
+- **P3** (cell 11): validates `manifest.parquet` columns + spot-checks frames on disk. Soft-warn (not hard fail) if data is missing — surfaces path issues before they block pretrain.
+
+The `RUN_PREPROCESSING=False` default means re-running the notebook after preprocessing has already happened is a no-op. P0's R3M clone happens unconditionally (it's tiny and useful as reference). Idempotency: P2 checks `manifest.parquet` and `<clip_uid>/4.jpg` before reprocessing each clip; killing and resuming preprocessing is safe.
+
 ### Cell 5 (logger)
 - Atomic JSON writes via `tmp` + `replace`.
 - Module-level `log(msg)` is the only print path used elsewhere — keeps logging consistent.
@@ -619,7 +637,10 @@ Things the design supports but we don't run:
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Ego4D path/cache layout mismatch | medium | high (blocks pretrain) | smoke test surfaces FileNotFoundError before production |
+| Ego4D path/cache layout mismatch | medium | high (blocks pretrain) | smoke test surfaces FileNotFoundError before production; P3 validates manifest before pretrain |
+| Preprocessing crash on a corrupt video | medium | low | per-clip try/except; `n_failed` counter logged; sweep continues |
+| `decord` not installable on Colab | low | low | P1 falls back to OpenCV automatically (~3× slower but portable) |
+| Colab session disconnects mid-preprocessing | medium | medium (re-run preprocessing) | manifest checkpointed every `log_every` clips; resume is automatic |
 | `mj_envs` env name drift | medium | medium (blocks one BC config) | per-run try/except logs the failing key; sweep continues |
 | CUDA OOM at full batch on shared A100 | low-medium | medium | halve `batch_clips`, OOM is loud |
 | `torch.compile` recompile loop on LoRA backbone | low | low | try/except falls back to eager |
@@ -635,13 +656,15 @@ Things the design supports but we don't run:
 
 | File | Purpose |
 |---|---|
-| `dinov2_r3m_benchmark.ipynb` | The deliverable — 30-cell notebook |
+| `dinov2_r3m_benchmark.ipynb` | The deliverable — 37-cell notebook |
 | `build_notebook.py` | Regenerates the notebook from a single Python source (easier to diff than raw .ipynb JSON) |
-| `smoke_test.py` | Standalone CPU smoke test (the one I ran while developing — exercises everything without DINOv2 or sim deps via a stub backbone) |
+| `smoke_test.py` | Standalone CPU smoke test for the core pipeline (exercises everything without DINOv2 or sim deps via a stub backbone) |
+| `smoke_test_preprocess.py` | Standalone smoke test for `preprocess_ego4d` against synthetic mp4 + narrations.json |
 | `run_notebook_offline.py` | Integration test that exec()s the notebook cells in order with DINOv2 + pyarrow + sim deps stubbed |
 | `2203.12601v3.pdf` | The R3M paper (reference) |
 | `paper.txt` | Plain-text extract of the paper (used during development to look up exact numbers) |
 | `ARCHITECTURE.md` | This file |
+| `README.md` | Operational instructions |
 
 ---
 
