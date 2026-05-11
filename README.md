@@ -6,7 +6,7 @@ Reproducible head-to-head against R3M (Nair et al., CoRL 2022) on R3M's publishe
 |---|---|---|---|
 | (Baseline 1: R3M) | ResNet50 + R3M-loss | Ego4D 1M steps | full backbone (numbers from paper) |
 | `baseline_2_dinov3_lora.ipynb` | **DINOv3 ViT-B/16 + LoRA + CLIP-text** | Ego4D 150k steps (R3M-loss) | LoRA r=16 + lang head (~7.6M) |
-| `baseline_3_dinov3_sam3.ipynb` | **DINOv3 ViT-B/16 + SAM 3 (frozen)** | none | BC MLP only (~200K) |
+| `baseline_3_dinov2_sam2.ipynb` | **DINOv2 ViT-B/14 + SAM 2 (frozen, center-point prompt)** on Robosuite Lift | none | BC MLP only (~300K) |
 
 **Hypothesis:** if Baseline 3 ≥ Baseline 2, Ego4D pretraining is redundant given DINOv3's strong init plus SAM 3's text-grounded object localization. If Baseline 2 > Baseline 3, the contrastive Ego4D pretraining adds something the foundation models alone don't capture.
 
@@ -33,7 +33,7 @@ git clone https://github.com/facebookresearch/r3m.git && cd r3m && pip install -
 git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e . && cd ..
 
 # 5. Run a notebook
-jupyter lab baseline_2_dinov3_lora.ipynb       # OR baseline_3_dinov3_sam3.ipynb
+jupyter lab baseline_2_dinov3_lora.ipynb       # OR baseline_3_dinov2_sam2.ipynb
 # Each notebook auto-detects Colab, patches paths to Drive, runs smoke tests, then production cells.
 ```
 
@@ -289,7 +289,7 @@ rm -rf cache/features/
 | File | Purpose |
 |---|---|
 | `baseline_2_dinov3_lora.ipynb` | Baseline 2 — 37-cell notebook (DINOv3 + LoRA + R3M-loss pretrain on Ego4D) |
-| `baseline_3_dinov3_sam3.ipynb` | Baseline 3 — 29-cell notebook (DINOv3 + SAM 3, fully frozen, no Ego4D pretrain) |
+| `baseline_3_dinov2_sam2.ipynb` | Baseline 3 — 29-cell notebook (DINOv2 + SAM 2 frozen, no Ego4D pretrain, Robosuite Lift on 50 teleop demos) |
 | `ARCHITECTURE.md` | Full design document — motivation, alternatives considered per component, pros/cons, risk register |
 | `README.md` | This file — operational instructions |
 | `build_notebook.py` | Regenerator for baseline 2 (`python3 build_notebook.py`) |

@@ -5,7 +5,7 @@
 **Three baselines:**
 - **Baseline 1 — R3M (paper).** ResNet50 with TCN+VLA+L1/L2 contrastive loss on Ego4D 1M steps. Numbers hardcoded from Tables 1-3 of arXiv:2203.12601.
 - **Baseline 2 — DINOv3 + LoRA + CLIP.** `baseline_2_dinov3_lora.ipynb`. DINOv3 ViT-B/16 frozen + LoRA r=16 trainable, R3M's exact loss formulation, Ego4D 150k steps (6.7× cut from R3M).
-- **Baseline 3 — DINOv3 + SAM 3 (frozen).** `baseline_3_dinov3_sam3.ipynb`. DINOv3 ViT-B/16 fully frozen + SAM 3 concept masking, **no Ego4D pretraining**, BC MLP only.
+- **Baseline 3 — DINOv2 + SAM 2 (frozen, public weights).** `baseline_3_dinov2_sam2.ipynb`. DINOv2 ViT-B/14 fully frozen + SAM 2 segmentation with a single center-point prompt, **no Ego4D pretraining**, BC MLP only on Robosuite Lift (50 teleop demos). Pragmatic deviation from the proposal (which called for DINOv3 + SAM 3) because both DINOv3 and SAM 3 are gated and we ran out of time to get access.
 
 **The hypothesis:** if Baseline 3 ≥ Baseline 2, then Ego4D pretraining is redundant given DINOv3's strong init plus SAM 3's text-grounded object localization. If Baseline 2 > Baseline 3, the contrastive Ego4D pretraining adds something the foundation models alone don't capture.
 
@@ -688,7 +688,7 @@ Things the design supports but we don't run:
 | File | Purpose |
 |---|---|
 | `baseline_2_dinov3_lora.ipynb` | Baseline 2 deliverable — 37-cell notebook (DINOv3 + LoRA + R3M-loss pretrain on Ego4D) |
-| `baseline_3_dinov3_sam3.ipynb` | Baseline 3 deliverable — 29-cell notebook (DINOv3 + SAM 3, fully frozen, no Ego4D pretrain) |
+| `baseline_3_dinov2_sam2.ipynb` | Baseline 3 deliverable — 29-cell notebook (DINOv2 + SAM 2 frozen, Robosuite Lift on 50 teleop demos) |
 | `build_notebook.py` | Regenerates baseline 2 from a single Python source (easier to diff than raw .ipynb JSON) |
 | `build_notebook_b3.py` | Regenerates baseline 3 |
 | `smoke_test.py` | Standalone CPU smoke test for baseline 2's core pipeline (DINOv3 stubbed) |
