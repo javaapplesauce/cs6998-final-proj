@@ -1,315 +1,110 @@
-# Three-Way Benchmark of Visual Representations for Robot Manipulation
+# How 2026 foundation models represent the manipulation world — and what that does to control
 
-Reproducible head-to-head against R3M (Nair et al., CoRL 2022) on R3M's published behavior-cloning protocol over Franka Kitchen, MetaWorld, and Adroit.
+CS6998 final project, v2. One harness, one benchmark (LIBERO Spatial/Object/Goal), one identical readout head
+applied to frozen models from four families, reporting closed-loop success, state probes and null-calibrated
+representational similarity. Design: [ARCHITECTURE.md](ARCHITECTURE.md). v1 notebooks: [legacy/](legacy/).
 
-| Notebook | Architecture | Pretrain | Trainable params |
-|---|---|---|---|
-| (Baseline 1: R3M) | ResNet50 + R3M-loss | Ego4D 1M steps | full backbone (numbers from paper) |
-| `baseline_2_dinov3_lora.ipynb` | **DINOv3 ViT-B/16 + LoRA + CLIP-text** | Ego4D 150k steps (R3M-loss) | LoRA r=16 + lang head (~7.6M) |
-| `baseline_3_dinov2_sam2.ipynb` | **DINOv2 ViT-B/14 + SAM 2 (frozen, center-point prompt)** on Robosuite Lift | none | BC MLP only (~300K) |
-
-**Hypothesis:** if Baseline 3 ≥ Baseline 2, Ego4D pretraining is redundant given DINOv3's strong init plus SAM 3's text-grounded object localization. If Baseline 2 > Baseline 3, the contrastive Ego4D pretraining adds something the foundation models alone don't capture.
-
-**Hardware target:** 1× NVIDIA A100 80GB. **Wall clock:** ≤ 4 hours per notebook.
-
----
-
-## TL;DR
+## Setup (Linux, 1× A100/H100 80GB, 16+ vCPUs, ~200 GB disk)
 
 ```bash
-# 1. Common deps
-pip install "torch>=2.7" torchvision pillow numpy pandas pyarrow matplotlib \
-            open_clip_torch nbformat decord       # decord optional (Ego4D preprocessing)
-
-# 2. Sim deps (needed for actual BC rollouts in either notebook)
-pip install git+https://github.com/Farama-Foundation/Metaworld.git
-git clone https://github.com/facebookresearch/r3m.git && cd r3m && pip install -e . && cd ..  # mj_envs
-
-# 3. Foundation-model gating (one-time)
-#    Baseline 2: DINOv3 only — request weights at https://ai.meta.com/dino-v3
-#    Baseline 3: DINOv3 + SAM 3 — request SAM 3 at https://huggingface.co/facebook/sam3, then `hf auth login`
-
-# 4. SAM 3 (Baseline 3 only)
-git clone https://github.com/facebookresearch/sam3.git && cd sam3 && pip install -e . && cd ..
-
-# 5. Run a notebook
-jupyter lab baseline_2_dinov3_lora.ipynb       # OR baseline_3_dinov2_sam2.ipynb
-# Each notebook auto-detects Colab, patches paths to Drive, runs smoke tests, then production cells.
+python -m venv .venv && . .venv/bin/activate          # Python >= 3.12
+pip install "lerobot[libero,groot,molmoact2,lingbot_va]==0.6.1" "diffusers==0.39.0" sentencepiece scikit-learn \
+    open_clip_torch==3.3.0 git+https://github.com/robbyant/lingbot-vision.git pytest
+# Tier-2 anchors only
+pip install git+https://github.com/facebookresearch/r3m.git@b2334e726887fa0206962d7984c69c5fb09cceab
+pip install --no-deps git+https://github.com/facebookresearch/vggt-omega.git@48b23c8ce72c9a8fcf987f0d7f43d8e4870759f6
+export MUJOCO_GL=egl OMP_NUM_THREADS=1
+huggingface-cli login
 ```
 
-### Running on Google Colab
+Why the extras: C-RADIOv4's remote code imports `open_clip`; Cosmos 3 needs diffusers 0.39.0 exactly (inside
+lerobot's range); vggt-omega pins numpy<2, which lerobot cannot accept, so it goes in with `--no-deps`.
+torchcodec needs system FFmpeg 4–8 built with an AV1 decoder (G1 checks). Disk: MolmoAct2 is a 21.8 GB fp32
+download, Wan2.2 ~34 GB (transformer + UMT5 + VAE), V-JEPA 2.1 5.2 GB. A full Tier-1 token cache would be
+~445 GB, so `train` deletes each suite's tokens once its heads exist and the driver extracts one suite at a time
+(peak: one suite of one model, ≤ 38 GB for the 16×16 ablations). scikit-learn is not pulled in by lerobot.
 
-Both notebooks auto-detect Colab. Cells 5-6 mount Drive, clone the repo into `/content/`, check dependencies, and patch `CONFIG` paths so caches and any pretrain checkpoint persist on Drive (not on Colab's ephemeral `/content/`). Just run cells in order — the Colab-specific paths are picked up automatically.
+Day 0: request gated access to `nvidia/Cosmos-Reason2-2B` (GR00T's tokenizer comes from it too),
+`facebook/VGGT-Omega`, `facebook/dinov3-vitl16-pretrain-lvd1689m`. `repstudy.policy.libero_setup()` writes
+`~/.libero/config.yaml` before the first `import libero.libero` (so nothing prompts on stdin) and pre-downloads
+`lerobot/libero-assets` to `~/.cache/libero/assets`, the only place hf-libero 0.1.4 looks (it ignores the
+config's `assets` key; without this, 30 env workers race to download).
 
-### Choosing a baseline
+The Mac/CPU path runs only the smoke test: `pytest tests/test_smoke.py` (G4, ~10 s).
 
-- Run **Baseline 2** first — it produces the canonical "we beat R3M with parameter-efficient adaptation" narrative and validates that demo data + sim envs work.
-- Then run **Baseline 3** to test whether the Ego4D pretraining stage was load-bearing. Baseline 3's `results/results.json` will be picked up by Baseline 2's plotting if both runs share a Drive root, and the side-by-side plot becomes a 3-way comparison.
+## Run order
 
----
+```bash
+python -m repstudy.run --stage g0      # env: imports, no prompt, assets in place, one EGL frame
+python -m repstudy.run --stage g1      # dataset contract + decoder parity (downloads lerobot/libero @ a1aaacb7)
+python -m repstudy.run --stage g2      # first-frame pixel + state parity vs the 50 init states
+python -m repstudy.run --stage g3      # replayed demos succeed
+pytest tests/test_smoke.py             # G4
 
-## What you get
+for i in 1 2; do for s in train eval; do python -m repstudy.run --model blind --stage $s; done; done   # §1.5 rule
+for s in g5 calibrate extract train eval; do                                                  # G6 pilot
+  python -m repstudy.run --model vjepa2_1 --stage $s --suites libero_spatial --seeds 0; done
+python -m repstudy.run --stage g6      # pilot clearly above blind; else edit CONFIG['head'] and redo the pilot
+python -m repstudy.run --stage g7      # suggested cut level -> results/gates.json
+CUT=0                                  # from G7; persisted in results/cut_level by the first call that passes it
 
-After a successful run:
-
-```
-results/
-├── results.json        # complete run record (config, every loss tick, every BC run + history)
-├── side_by_side.png    # per-env bar chart, ours vs R3M
-├── per_task.png        # per-task bars (Franka / MW / Adroit)
-├── pretrain_curves.png # TCN + lang + total loss vs step
-└── summary.md          # auto-generated markdown report — read this for the morning presentation
-```
-
----
-
-## Dependencies
-
-### Python packages
-
-| Package | Why |
-|---|---|
-| `torch >= 2.3` | bf16, `torch.compile`, current `torch.hub` API |
-| `torchvision` | image transforms |
-| `pillow` | JPEG load + resize (uses `Image.Resampling.BICUBIC`) |
-| `numpy`, `pandas` | manifest handling, aggregation |
-| `pyarrow` | reads/writes `manifest.parquet` |
-| `matplotlib` | side-by-side bars, training curves |
-| `open_clip_torch` | CLIP `ViT-B-32-quickgelu` (must be the `-quickgelu` variant for `pretrained='openai'`) |
-| `decord` | optional — fast video decoder used by Ego4D preprocessing. Falls back to `opencv-python` if not installed. |
-| `nbformat` | optional, only for re-validating the notebook |
-
-### Sim dependencies (only needed for BC rollouts in the production run)
-
-- **`metaworld`** — `pip install git+https://github.com/Farama-Foundation/Metaworld.git`
-- **`mj_envs` (R3M's fork)** — provides the modified Franka Kitchen with desk randomization and the Adroit envs. Install from `facebookresearch/r3m`'s repo.
-
-The smoke tests stub the simulator and **do not require either of these** — useful for first-pass verification on a fresh box before the heavyweight installs.
-
-### Hardware
-
-- 1× A100 80GB recommended. Smaller GPUs may need `CONFIG['batch_clips'] = 8` (halved from 16) — train for the same number of total samples by doubling pretrain steps, or accept fewer cross-video negatives per anchor.
-- ~50 GB free disk: caches (CLIP text, pretrain checkpoint, per-(task, view) features) total ~30 GB; results dir ~5 MB.
-
----
-
-## Required data
-
-The notebook does **not** download Ego4D or generate the demo data. Ego4D access requires registration at https://ego4d-data.org. The demo `.pkl` files come from R3M's eval pipeline.
-
-### 1. Ego4D pre-extracted frames
-
-Expected layout under `CONFIG['ego4d_root']`:
-
-```
-ego4d_root/
-├── manifest.parquet                # columns: clip_uid (str), narration (str), n_frames (int)
-├── <clip_uid_001>/
-│   ├── 0.jpg                       # I0 from first 20% of clip
-│   ├── 1.jpg                       # Ii (middle frame 1)
-│   ├── 2.jpg                       # Ij (middle frame 2)
-│   ├── 3.jpg                       # Ik (middle frame 3)
-│   └── 4.jpg                       # Ig from last 20% of clip
-├── <clip_uid_002>/
-│   ...
-```
-
-R3M's repo does **not** ship a preprocessing script — their README says the dataset is assumed to already be parsed into frames. Two options:
-
-**Option A: you already have the frames cached** (e.g. from a prior R3M run). Point `CONFIG['ego4d_root']` at the directory and skip the preprocessing cells (`RUN_PREPROCESSING = False`, the default).
-
-**Option B: preprocess raw Ego4D in the notebook.** Cells P0-P3 (just after Cell 4) handle this:
-1. Download raw Ego4D via the [Ego4D CLI](https://github.com/facebookresearch/Ego4d) after registering: `ego4d --output_directory <data_root> --datasets full_scale annotations`. You get `<data_root>/v2/full_scale/<video_uid>.mp4` and `<data_root>/v2/annotations/narrations.json`.
-2. Set `EGO4D_VIDEOS_DIR` and `EGO4D_NARRATIONS_FILE` in cell P2.
-3. Set `RUN_PREPROCESSING = True` in cell P2.
-4. Set `subset_n=50000` (or larger if you have more time/disk). Full Ego4D (~5M narrations) is 1-2 weeks of single-process work; 50k narrations on Colab CPU is ~40-90 min.
-5. Run cells P0 (clone R3M for reference) → P1 (define preprocess function) → P2 (run) → P3 (validate).
-
-Preprocessing is idempotent — re-running with `skip_existing=True` (default) picks up where it left off, so a Colab session disconnect mid-preprocessing only loses the current `log_every`-clip checkpoint window. Output is written incrementally; the manifest is checkpointed every 500 clips.
-
-The preprocessor uses `decord` for fast random-access video decoding; if `decord` isn't installed (e.g. on arm64 Mac), it falls back to OpenCV per-frame seek (~3× slower but portable).
-
-### 2. R3M demo episodes
-
-Expected layout under `CONFIG['demo_root']`:
-
-```
-demo_root/
-├── franka_kitchen/
-│   ├── slide/view1/demo_0.pkl, demo_1.pkl, ...
-│   ├── slide/view2/...
-│   ├── light/view1/...
-│   └── ...
-├── metaworld/
-│   ├── assembly-v2/view1/...
-│   └── ...
-└── adroit/
-    ├── pen-v0/view1/...
-    └── relocate-v0/view1/...
-```
-
-Each `.pkl` is a dict:
-```python
-{
-    'images':  np.ndarray,  # shape (T, H, W, 3), uint8
-    'actions': np.ndarray,  # shape (T, A), float32
-    'proprio': np.ndarray,  # shape (T, P), float32 — joint pos/vel etc, env-specific
-    'success': bool,        # whether the demo episode reached goal
+run() {  # one model, tokens one suite at a time
+  python -m repstudy.run --model $1 --stage g5 --cut-level $CUT && python -m repstudy.run --model $1 --stage calibrate
+  for su in libero_spatial libero_object libero_goal; do
+    for s in extract train; do python -m repstudy.run --model $1 --stage $s --suites $su; done; done
+  for s in eval probe; do python -m repstudy.run --model $1 --stage $s; done
 }
+for m in random_vit vjepa2_1 cradio4 qwen3vl_2b cosmos_reason2 groot_n17 lingbot_va wan22 molmoact2 tipsv2 \
+         lingbot_vision vjepa2_1_t256 cradio4_t256; do run $m; done            # Tier 1, then §1.5 ablations
+python -m repstudy.run --model wan22_512 --stage probe                         # §1.5 resolution check (offline)
+for m in qwen3vl_2b cosmos_reason2 groot_n17 molmoact2 lingbot_va wan22; do    # §1.4 secondary, offline
+  python -m repstudy.run --model $m --stage calibrate --text instruction; done
+for m in lingbot_va wan22; do for su in libero_spatial libero_object libero_goal; do   # secondary, L3 closed loop
+  for s in extract train; do python -m repstudy.run --model $m --stage $s --suites $su --text instruction; done; done
+  python -m repstudy.run --model $m --stage eval --text instruction; done
+for m in vggt_omega cosmos3_reason cosmos3_gen xiaomi_r1 qwen3vl_4b dinov3_l vjepa2_l r3m; do run $m; done  # Tier 2
+python -m repstudy.run --stage weightdiff   # CPU-only ladder audit
+python -m repstudy.run --stage analyze      # results/summary.md + figures (uses the persisted cut level)
 ```
 
-These are produced by R3M's eval pipeline. Confirm camera names per view and proprio composition match what your `mj_envs` version exposes — the `# TODO: confirm` flags in Cell 15 surface as exceptions on the first BC call if there's a mismatch.
+Stages skip finished work: calibration is reused once done for the configured suites, heads and evals are keyed
+by site, seeds, proprio condition and a hash of the head config (a G6 retune never reuses stale heads), probes
+are reused when every site is cached, and cut closed loops (§1.9) skip their extraction and training too.
+`run_colab.ipynb` drives the same sequence.
 
----
+## Outputs
 
-## How to run
-
-### Step 1 — set paths
-
-Two modes:
-
-- **Local box**: open `baseline_2_dinov3_lora.ipynb`, edit **Cell 4 (CONFIG)** to point at your data:
-  ```python
-  CONFIG['ego4d_root'] = '/data/ego4d_r3m_frames'   # your Ego4D cache
-  CONFIG['demo_root']  = '/data/r3m_demos'          # your demo .pkl tree
-  ```
-- **Google Colab**: just run cells in order. Cells 5-6 auto-mount Drive and patch `CONFIG` paths to `/content/drive/MyDrive/cs6998-final-proj-data/...`. Edit those defaults in cell 6 if your Drive layout differs.
-
-Optionally set `CONFIG['cut_level']` (0=full, 1=drop Adroit, 2=demo sizes 3→2, 3=seeds 3→2, 4=drop view 3, 5=pretrain 150k→100k). Default is 1.
-
-### Step 1.5 — preprocess Ego4D (only if needed)
-
-Skip if you already have `<ego4d_root>/manifest.parquet` + `<clip_uid>/{0..4}.jpg`. Otherwise see the "Option B: preprocess raw Ego4D in the notebook" path under **Required data** above.
-
-### Step 2 — run smoke tests first
-
-The smoke section (Cells 21-23) builds synthetic micro-data, exercises every pipeline stage, and asserts each stage's contract. **Run this before kicking off the production run.**
-
-- ~2 minutes on A100 (after one-time DINOv2 ~330 MB + CLIP ~600 MB downloads)
-- ~5 minutes on CPU
-- Stubs the simulator (real sim envs are exercised on the first BC sweep call)
-
-Look for `=== ALL SMOKE TESTS PASSED ===` at the end. If you see an `AssertionError`, the failing assertion describes the contract that broke — usually a path/version issue surfaces here.
-
-### Step 3 — run the production cells (Cells 25-30)
-
-Once smoke passes, run cells in order. Each stage is independently re-runnable:
-
-| Cell | Stage | Skip condition |
-|---|---|---|
-| 32 (PROD 1) | CLIP text cache (3-5 min) | `cache/clip_text_embeds.pt` exists |
-| 33 (PROD 2) | Pretrain (~2.0-2.3 h) | `cache/pretrain.pt` exists |
-| 34 (PROD 3) | Feature extraction (~10-15 min) | per-(task, view) cache hit |
-| 35 (PROD 4) | BC sweep (~60-80 min) | always runs |
-| 36 (PROD 5) | Aggregation + plots | always runs |
-| 37 (PROD 6) | Markdown summary | always runs |
-
-To force a re-run of any stage, delete its cache file. To skip the smoke tests on subsequent runs, set `RUN_SMOKE_TESTS = False` in Cell 21.
-
-### Step 4 — read the report
-
-Open `results/summary.md` and the three PNGs in `results/`. The summary has the per-environment delta vs R3M, per-task breakdown, and reproduction notes.
-
----
-
-## Configuration knobs
-
-Everything lives in `CONFIG` (Cell 4). Highlights:
-
-| Knob | Default | Purpose |
-|---|---|---|
-| `pretrain_steps` | 150,000 | Pretrain budget. R3M used 1M; we cut by 6.7× citing DINOv2's strong init. |
-| `batch_clips` | 16 | Video clips per batch (× 5 frames = 80 imgs/step). R3M's value. |
-| `lora_rank`, `lora_alpha` | 16, 16 | LoRA capacity (~2.4M trainable params). |
-| `lambda_tcn`, `lambda_lang`, `lambda_l1`, `lambda_l2` | 1, 1, 1e-5, 1e-5 | Loss weights from R3M Appendix A.2 (paper exact). |
-| `bc_lr`, `bc_batch`, `bc_steps`, `bc_eval_every` | 1e-3, 32, 20k, 1k | BC protocol from R3M Appendix B.5 (paper exact). |
-| `bc_eval_episodes` | 10 | Cut from R3M's 25 (saves ~2.5×; widens std-err to ±5 pp). |
-| `bc_early_stop_patience` | 3 | Stop BC after 3 consecutive non-improving evals. |
-| `cut_level` | 1 | Scope reduction ladder. See ARCHITECTURE.md §4.15. |
-| `compile_model`, `precision` | True, 'bf16' | bf16 + `torch.compile(reduce-overhead)`. Disable compile if you see recompile warnings. |
-
----
-
-## Output artifacts
-
-```
-cache/                              # disk-cached intermediate state (not committed)
-├── clip_text_embeds.pt             # ~10 GB at full Ego4D
-├── pretrain.pt                     # ~10 MB (LoRA + lang_head only)
-└── features/<env>/<task>__<view>.pt # per-(task, view) demo features
-
-results/                            # the deliverable
-├── results.json                    # config + every pretrain loss tick + every BC run with full eval history
-├── side_by_side.png
-├── per_task.png
-├── pretrain_curves.png
-└── summary.md                      # auto-generated, the morning-presentation report
-```
-
-`results.json` is the single source of truth for any post-hoc analysis. The plots and markdown are derived from it.
-
----
-
-## Troubleshooting
-
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| `FileNotFoundError: manifest.parquet` | `CONFIG['ego4d_root']` wrong or no preprocessing run | re-check path; or set `RUN_PREPROCESSING=True` in cell P2 to preprocess in-notebook |
-| `decord` install fails on arm64 Mac | no prebuilt wheel | the preprocessor falls back to OpenCV automatically; or skip preprocessing locally and run only on Linux/Colab |
-| Preprocessing slow (>200 ms/clip) | OpenCV fallback being used | `pip install decord` for ~3× speedup on Linux/Colab |
-| `KeyError` in MetaWorld env lookup | env name strings differ across MetaWorld versions | the cell tries both `ALL_V2_ENVIRONMENTS_GOAL_OBSERVABLE` and `ALL_V2_ENVIRONMENTS`; if both miss, check your installed metaworld version's keys |
-| Black/zero rendered frames | wrong camera name for the view | edit `view_to_camera` in Cell 15; visual-check first frame |
-| `ImportError: pyarrow` lib not loaded | broken pyarrow install | `pip install --force-reinstall pyarrow` |
-| `UserWarning: QuickGELU mismatch` | using `'ViT-B-32'` instead of `'ViT-B-32-quickgelu'` | already fixed in CONFIG; if you see this you're not on the latest notebook |
-| OOM during pretrain | shared GPU or other tenant | `CONFIG['batch_clips'] = 8` |
-| `torch.compile` recompile warnings spam | LoRA shape changes per call | set `CONFIG['compile_model'] = False` |
-| `_pickle.PicklingError: Can't pickle FeatureBCDataset` | spawn-based multiprocessing on Mac/Windows | already fixed (BC inner loader uses `num_workers=0`); if you re-introduce workers, define `FeatureBCDataset` in a real .py module |
-| BC sweep skipped with `no pretrained model available` | pretrain didn't finish or checkpoint path is wrong | check Cell 26 output; confirm `cache/pretrain.pt` exists |
-| Smoke tests pass but production hangs at first rollout | sim env env-name or proprio mismatch | the rollout will eventually time out or crash — check the `# TODO: confirm` flags in Cell 15 against your `mj_envs` install |
-
----
-
-## Re-running individual stages
-
-```bash
-# re-run pretrain only (delete the checkpoint)
-rm cache/pretrain.pt && jupyter nbconvert --execute --to notebook --inplace baseline_2_dinov3_lora.ipynb
-
-# re-run feature extraction only (delete cached features)
-rm -rf cache/features/
-
-# re-run BC + aggregation only (don't delete anything)
-# Just run Cells 28-30 manually
-```
-
----
-
-## Files in this project
-
-| File | Purpose |
+| path | content |
 |---|---|
-| `baseline_2_dinov3_lora.ipynb` | Baseline 2 — 37-cell notebook (DINOv3 + LoRA + R3M-loss pretrain on Ego4D) |
-| `baseline_3_dinov2_sam2.ipynb` | Baseline 3 — 29-cell notebook (DINOv2 + SAM 2 frozen, no Ego4D pretrain, Robosuite Lift on 50 teleop demos) |
-| `ARCHITECTURE.md` | Full design document — motivation, alternatives considered per component, pros/cons, risk register |
-| `README.md` | This file — operational instructions |
-| `build_notebook.py` | Regenerator for baseline 2 (`python3 build_notebook.py`) |
-| `build_notebook_b3.py` | Regenerator for baseline 3 |
-| `smoke_test.py` | Standalone CPU smoke test against synthetic data for baseline 2's pipeline (DINOv3 stubbed) |
-| `smoke_test_preprocess.py` | Standalone smoke test for `preprocess_ego4d` against synthetic mp4 + narrations.json |
-| `run_notebook_offline.py` | Integration test that exec()s baseline 2's cells in order with DINOv3 / pyarrow / sim deps stubbed |
-| `run_notebook_offline_b3.py` | Integration test for baseline 3 (DINOv3 + SAM 3 + sim deps stubbed) |
-| `2203.12601v3.pdf` | The R3M paper (reference) |
-| `paper.txt` | Plain-text extract of the paper (used during development to look up exact numbers) |
-| `proposal_template (3).tex` | Original project proposal that motivated baseline 3 |
-| `milestone_template.tex` | Mid-semester milestone report |
+| `results/<model>.json` | gates, calibration curve, selected site, training, per-trial eval, probes, timings |
+| `results/heads/<model>/<site>/` | self-contained head checkpoints (normalisation in buffers) |
+| `results/gates.json` | G1/G2/G3/G7 reports |
+| `results/weightdiff.json` | per-module relative weight change along each ladder |
+| `results/summary.md`, `results/analysis.json`, `results/fig_*.png` | final tables, contrasts, similarity, figures |
 
----
+## Models
 
-## References
+Tier 1 runs in this order: blind, random_vit, vjepa2_1, cradio4, qwen3vl_2b, cosmos_reason2, groot_n17,
+lingbot_va, wan22, molmoact2, tipsv2, lingbot_vision. Tier 2 (as hours remain): vggt_omega, cosmos3 reasoner
+and generator, qwen3vl_4b → xiaomi_r1, dinov3_l, vjepa2_l, r3m. Ablations: vjepa2_1_t256 and cradio4_t256
+(16×16 token budget, closed loop), wan22_512 (offline resolution check).
 
-- **R3M paper:** Nair et al., *R3M: A Universal Visual Representation for Robot Manipulation*, CoRL 2022. arXiv:[2203.12601](https://arxiv.org/abs/2203.12601). Local: `2203.12601v3.pdf`.
-- **R3M code & eval pipeline:** [facebookresearch/r3m](https://github.com/facebookresearch/r3m).
-- **DINOv2:** Oquab et al., *DINOv2: Learning Robust Visual Features without Supervision*, 2023. [facebookresearch/dinov2](https://github.com/facebookresearch/dinov2). Loaded via `torch.hub`.
-- **CLIP / open_clip:** Radford et al., 2021. We use `'ViT-B-32-quickgelu'` with `pretrained='openai'`.
+| model | weights | input → native grid | D | sites (1-indexed depth) | prompt reaches tokens? |
+|---|---|---|---:|---|---|
+| vjepa2_1 / random_vit | vjepa2 hub @204698b + `vjepa2_1_vitl_dist_vitG_384.pt` (`ema_encoder`) | 384² as (B,3,1,·,·), image tokenizer → 24×24 | 1024 | L6 L12 L18 L24 (per-level norms_block) | – |
+| cradio4 | nvidia/C-RADIOv4-H @0057b33 (remote code) | [0,1] 512² → 32×32 (−3 summary −7 reg) | 1280 | L8 L16 L24 L32 | – |
+| tipsv2 | google/tipsv2-l14 @52847a7 (remote code) | [0,1] 448² → 32×32 (−CLS −1 reg) | 1024 | L6 L12 L18 L24 (norm=False) | – (dual encoder) |
+| lingbot_vision | `load_pretrained_backbone(variant="large")` | 512² → 32×32 (−CLS −4 storage) | 1024 | L6 L12 L18 L24 | – |
+| qwen3vl_2b / cosmos_reason2 / groot_n17 | Qwen3Backbone(select_layer=16); GR00TN17.backbone | 256² → 16×16 → 2×2 merge → 8×8 | 2048 | L4 L8 L12 L16 (hooks, pre-norm) | no: image before text, causal |
+| molmoact2 | allenai/MolmoAct2 @e432d85 via MolmoAct2Policy | 378² → 27×27 ViT → 14×14 | 2560 | L9 L18 L27 L36 (pre ln_f) | no: image before text |
+| wan22 / lingbot_va | Wan2.2-TI2V-5B-Diffusers; lerobot/lingbot_va_base | 256² → VAE 16×16 → patch 2 → 8×8 per latent frame | 3072 | b8 b15 b22 b30 × {obs, pred} | yes (cross-attention) |
+| vggt_omega (T2) | facebook/VGGT-Omega 1B-512 (gated) | [0,1] 512² → 32×32 | 2048 | A5 A12 A18 A24 (aggregator) | – |
+| qwen3vl_4b / xiaomi_r1 / cosmos3_reason (T2) | Qwen3-VL-4B; XR1 `model_states.pt` VLM half; Cosmos3-Nano und tower | 256² → 8×8 | 2560 / 2560 / 4096 | L9 L18 L27 L36 | no |
+| cosmos3_gen (T2) | Cosmos3-Nano gen tower (diffusers 0.39) | 5×256² → 2 latent frames × 8×8 | 4096 | {O,P} × 9 18 27 36 | yes |
+| dinov3_l / vjepa2_l / r3m (T2 anchors) | gated DINOv3 ViT-L/16; HF vjepa2-vitl-fpc64-256; R3M RN50 | 512² → 32×32; 256² → 16×16; 256² → stage maps | 1024 / 1024 / 256–2048 | L6–L24; L6–L24; layer1–4 | – |
 
-For the rationale behind every architectural choice, see **`ARCHITECTURE.md`**.
+Ladder notes (from source, not the plan text): GR00T keeps LLM layers 0–15 and its action head reads the
+pre-norm layer-16 output; LingBot-VA's checkpoint is 839 tensors = 823 of Wan's 825 + Wan's Conv3d patch
+embedding re-expressed as a Linear + 14 new action tensors, stored bf16; both L3 rungs share VAE and UMT5 bytes
+and read out at the same noise timestep (t=999). Instruction-on is a no-op for prompt-invariant models
+(`CONFIG['prompt_invariant']`, asserted by G5), so its closed loop is only run for the L3 pair.
