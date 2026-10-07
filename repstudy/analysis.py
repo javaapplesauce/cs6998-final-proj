@@ -375,6 +375,23 @@ def analyze(cfg):
             probe_sel[m] = p
             lines.append(f"| {m} | " + " | ".join(f"{p.get(t, float('nan')):.3f}" for t in TARGETS + ("task",)) + " |")
 
+    # ---- H3: observed vs predicted-future tokens (video models; Cosmos 3 uses O/P site names)
+    pairs_h3 = []
+    for m in models:
+        c = R[m].get("calibrate", {}).get("generic") or {}
+        pr = R[m].get("probe", {})
+        names = set(c) | set(pr)
+        for o in sorted(names, key=lambda x: int("".join(ch for ch in x if ch.isdigit()) or 0)):
+            q = o.replace("/obs", "/pred") if o.endswith("/obs") else "P" + o[1:] if o[:1] == "O" and o[1:].isdigit() else None
+            if q and q in names:
+                f = lambda d, k: f"{d[k]:.4f}" if isinstance(d.get(k), float) else "–"  # noqa: E731
+                pairs_h3.append(f"| {m} | {o.split('/')[0] if '/' in o else o[1:]} | {f(c, o)} | {f(c, q)} | "
+                                f"{f(pr.get(o, {}), 'offset')} | {f(pr.get(q, {}), 'offset')} |")
+    if pairs_h3:
+        lines += ["", "## Observed vs predicted-future tokens (H3; held-out chunk L1, lower is better; offset R²)", "",
+                  "| model | block | L1 obs | L1 pred | offset R² obs | offset R² pred |", "|---|---|---:|---:|---:|---:|"]
+        lines += pairs_h3
+
     # ---- probe-success link (exploratory, §1.6)
     lines += ["", "## Probe → success link (Spearman across models, exploratory)", ""]
     both = [m for m in probe_sel if m in success and m not in cfg["ablations"] + cfg["offline_only"]]

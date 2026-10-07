@@ -2,7 +2,8 @@
 
 CS6998 final project, v2. One harness, one benchmark (LIBERO Spatial/Object/Goal), one identical readout head
 applied to frozen models from four families, reporting closed-loop success, state probes and null-calibrated
-representational similarity. Design: [ARCHITECTURE.md](ARCHITECTURE.md). v1 notebooks: [legacy/](legacy/).
+representational similarity. Design: [ARCHITECTURE.md](ARCHITECTURE.md). Hypotheses, contrasts and rules fixed
+before production: [PROTOCOL.md](PROTOCOL.md). v1 notebooks: [legacy/](legacy/).
 
 ## Setup (Linux, 1× A100/H100 80GB, 16+ vCPUs, ~200 GB disk)
 
@@ -30,7 +31,7 @@ Day 0: request gated access to `nvidia/Cosmos-Reason2-2B` (GR00T's tokenizer com
 `lerobot/libero-assets` to `~/.cache/libero/assets`, the only place hf-libero 0.1.4 looks (it ignores the
 config's `assets` key; without this, 30 env workers race to download).
 
-The Mac/CPU path runs only the smoke test: `pytest tests/test_smoke.py` (G4, ~10 s).
+The Mac/CPU path runs only the smoke test: `pytest tests/test_smoke.py` (G4, < 60 s).
 
 ## Run order
 
